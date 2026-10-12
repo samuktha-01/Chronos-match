@@ -104,6 +104,39 @@ class PriceLevel:
         self._total_volume -= order.quantity
         return order
 
+    def reduce_order_quantity(self, order_id: str, filled_qty: int) -> Order:
+        """Reduce the resting quantity of an order by filled_qty (partial fill).
+
+        Args:
+            order_id: Identifier of the order to reduce.
+            filled_qty: Executed quantity to deduct (must be strictly positive and strictly less than order.quantity).
+
+        Returns:
+            The partially filled Order instance.
+
+        Raises:
+            KeyError: If order_id is not present at this price level.
+            TypeError: If filled_qty is not an integer or is a boolean.
+            ValueError: If filled_qty is <= 0 or >= order.quantity.
+        """
+        if order_id not in self._orders:
+            raise KeyError(f"Order '{order_id}' not found at price level {self.price}")
+        if isinstance(filled_qty, bool) or not isinstance(filled_qty, int):
+            raise TypeError(f"filled_qty must be an integer, got {type(filled_qty).__name__}")
+        if filled_qty <= 0:
+            raise ValueError(f"filled_qty must be strictly positive (> 0), got {filled_qty}")
+
+        order = self._orders[order_id]
+        if filled_qty >= order.quantity:
+            raise ValueError(
+                f"filled_qty {filled_qty} must be strictly less than order quantity {order.quantity}. "
+                f"Use remove_order for full fills."
+            )
+
+        order.quantity -= filled_qty
+        self._total_volume -= filled_qty
+        return order
+
     def get_order(self, order_id: str) -> Order | None:
         """Retrieve an order by ID at this price level without removing it."""
         return self._orders.get(order_id)
@@ -241,6 +274,27 @@ class OrderBookSide:
 
         return order
 
+    def reduce_order_quantity(
+        self, order_id: str, price: float | int | Decimal, filled_qty: int
+    ) -> Order:
+        """Reduce the resting quantity of an order at a price level by filled_qty.
+
+        Args:
+            order_id: ID of the order to reduce.
+            price: Price level where the order rests.
+            filled_qty: Quantity filled.
+
+        Returns:
+            The partially filled Order instance.
+
+        Raises:
+            KeyError: If price level or order_id is not found.
+            TypeError: If filled_qty has an invalid type.
+            ValueError: If filled_qty is invalid.
+        """
+        level = self._price_levels[price]
+        return level.reduce_order_quantity(order_id, filled_qty)
+
     def get_orders_at_price(self, price: float | int | Decimal) -> list[Order]:
         """Return list of orders resting at the given price level in FIFO order."""
         level = self._price_levels.get(price)
@@ -366,6 +420,33 @@ class LimitOrderBook:
             self.asks.remove_order(order.order_id, order.price)
 
         return order
+
+    def reduce_order_quantity(self, order_id: str, filled_qty: int) -> Order:
+        """Partially fill an existing resting order by reducing its quantity.
+
+        Args:
+            order_id: ID of the resting order.
+            filled_qty: Quantity executed in the fill.
+
+        Returns:
+            The partially filled Order instance.
+
+        Raises:
+            TypeError: If order_id or filled_qty has an invalid type.
+            ValueError: If order_id is empty or filled_qty is invalid.
+            OrderNotFoundError: If order_id is not found in the book.
+        """
+        validate_order_id(order_id)
+        if order_id not in self._orders:
+            raise OrderNotFoundError(
+                f"Order with ID '{order_id}' not found in the order book."
+            )
+
+        order = self._orders[order_id]
+        if order.is_buy:
+            return self.bids.reduce_order_quantity(order.order_id, order.price, filled_qty)
+        else:
+            return self.asks.reduce_order_quantity(order.order_id, order.price, filled_qty)
 
     def cancel_order(self, order_id: str) -> Order:
         """Convenience alias for remove_order."""

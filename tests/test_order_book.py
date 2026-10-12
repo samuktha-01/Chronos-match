@@ -878,3 +878,86 @@ class TestStressAndInvariants:
         assert book.best_bid is None
         assert book.best_ask is None
 
+
+class TestReduceOrderQuantity:
+    """Test suite for partial fill quantity reduction in PriceLevel, OrderBookSide, and LimitOrderBook."""
+
+    def test_reduce_buy_order_quantity(self) -> None:
+        """Verify reducing a resting BUY order updates order quantity, level volume, and book volume."""
+        book = LimitOrderBook()
+        order = Order("b-1", OrderSide.BUY, 100.0, 50)
+        book.add_order(order)
+
+        assert book.total_volume == 50
+        assert book.get_volume_at_price(100.0) == 50
+
+        reduced = book.reduce_order_quantity("b-1", 20)
+        assert reduced == order
+        assert order.quantity == 30
+        assert book.total_volume == 30
+        assert book.get_volume_at_price(100.0) == 30
+        assert book.get_order("b-1").quantity == 30
+        assert len(book) == 1
+
+    def test_reduce_sell_order_quantity(self) -> None:
+        """Verify reducing a resting SELL order updates order quantity, level volume, and book volume."""
+        book = LimitOrderBook()
+        order = Order("s-1", OrderSide.SELL, 105.0, 40)
+        book.add_order(order)
+
+        reduced = book.reduce_order_quantity("s-1", 15)
+        assert reduced == order
+        assert order.quantity == 25
+        assert book.total_volume == 25
+        assert book.get_volume_at_price(105.0) == 25
+
+    def test_reduce_order_preserves_fifo_position(self) -> None:
+        """Verify partially reducing head order preserves its top priority in FIFO queue."""
+        book = LimitOrderBook()
+        ord1 = Order("b-1", OrderSide.BUY, 100.0, 50, timestamp=1000)
+        ord2 = Order("b-2", OrderSide.BUY, 100.0, 30, timestamp=2000)
+        book.add_order(ord1)
+        book.add_order(ord2)
+
+        book.reduce_order_quantity("b-1", 20)
+
+        orders = book.get_orders_at_price(100.0)
+        assert orders == [ord1, ord2]
+        assert book.best_bid_order == ord1
+        assert ord1.quantity == 30
+        assert ord2.quantity == 30
+
+    def test_reduce_unknown_order_raises(self) -> None:
+        """Verify reducing non-existent order raises OrderNotFoundError."""
+        book = LimitOrderBook()
+        with pytest.raises(OrderNotFoundError):
+            book.reduce_order_quantity("ghost", 10)
+
+    @pytest.mark.parametrize("invalid_qty", [0, -1, -50])
+    def test_reduce_non_positive_quantity_raises(self, invalid_qty: int) -> None:
+        """Verify reducing with zero or negative quantity raises ValueError."""
+        book = LimitOrderBook()
+        book.add_order(Order("b-1", OrderSide.BUY, 100.0, 50))
+        with pytest.raises(ValueError, match="strictly positive"):
+            book.reduce_order_quantity("b-1", invalid_qty)
+
+    @pytest.mark.parametrize("invalid_type", [None, 10.5, "10", True, False])
+    def test_reduce_invalid_quantity_type_raises(self, invalid_type: object) -> None:
+        """Verify non-integer or boolean quantity raises TypeError."""
+        book = LimitOrderBook()
+        book.add_order(Order("b-1", OrderSide.BUY, 100.0, 50))
+        with pytest.raises(TypeError, match="filled_qty must be an integer"):
+            book.reduce_order_quantity("b-1", invalid_type)  # type: ignore[arg-type]
+
+    def test_reduce_equal_or_exceeding_quantity_raises(self) -> None:
+        """Verify reducing by full quantity or more raises ValueError (remove_order should be used)."""
+        book = LimitOrderBook()
+        book.add_order(Order("b-1", OrderSide.BUY, 100.0, 50))
+
+        with pytest.raises(ValueError, match="strictly less than order quantity"):
+            book.reduce_order_quantity("b-1", 50)
+
+        with pytest.raises(ValueError, match="strictly less than order quantity"):
+            book.reduce_order_quantity("b-1", 51)
+
+

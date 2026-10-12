@@ -1,5 +1,6 @@
 """ChronosMatch: Zero-Copy High-Frequency Trading Engine."""
 
+from chronosmatch.matching_engine import MatchingEngine, Trade, TradeEvent
 from chronosmatch.models import Order, OrderSide, Side
 from chronosmatch.order_book import (
     DuplicateOrderError,
@@ -25,4 +26,7 @@ __all__ = [
     "OrderBookError",
     "DuplicateOrderError",
     "OrderNotFoundError",
+    "MatchingEngine",
+    "Trade",
+    "TradeEvent",
 ]
