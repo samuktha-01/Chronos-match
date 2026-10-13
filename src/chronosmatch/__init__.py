@@ -1,5 +1,17 @@
 """ChronosMatch: Zero-Copy High-Frequency Trading Engine."""
 
+from chronosmatch.binary_protocol import (
+    MAX_ORDER_ID_LENGTH,
+    ORDER_STRUCT_FORMAT,
+    ORDER_STRUCT_SIZE,
+    PRICE_SCALE,
+    SIDE_BUY_CODE,
+    SIDE_SELL_CODE,
+    decode_order,
+    decode_order_from,
+    encode_order,
+    encode_order_into,
+)
 from chronosmatch.matching_engine import MatchingEngine, Trade, TradeEvent
 from chronosmatch.models import Order, OrderSide, Side
 from chronosmatch.order_book import (
@@ -29,4 +41,14 @@ __all__ = [
     "MatchingEngine",
     "Trade",
     "TradeEvent",
+    "encode_order",
+    "decode_order",
+    "encode_order_into",
+    "decode_order_from",
+    "ORDER_STRUCT_FORMAT",
+    "ORDER_STRUCT_SIZE",
+    "MAX_ORDER_ID_LENGTH",
+    "PRICE_SCALE",
+    "SIDE_BUY_CODE",
+    "SIDE_SELL_CODE",
 ]
