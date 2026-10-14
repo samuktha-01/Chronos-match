@@ -23,6 +23,17 @@ from chronosmatch.order_book import (
     OrderNotFoundError,
     PriceLevel,
 )
+from chronosmatch.shared_memory import (
+    MalformedRecordError,
+    SharedMemoryBoundsError,
+    SharedMemoryClosedError,
+    SharedMemoryConsumer,
+    SharedMemoryError,
+    SharedMemoryProducer,
+    SharedMemoryReadOnlyError,
+    SharedMemoryRecordSizeError,
+    SharedMemoryRegion,
+)
 
 __version__ = "0.1.0"
 
@@ -51,4 +62,13 @@ __all__ = [
     "PRICE_SCALE",
     "SIDE_BUY_CODE",
     "SIDE_SELL_CODE",
+    "SharedMemoryRegion",
+    "SharedMemoryProducer",
+    "SharedMemoryConsumer",
+    "SharedMemoryError",
+    "SharedMemoryClosedError",
+    "SharedMemoryBoundsError",
+    "SharedMemoryRecordSizeError",
+    "SharedMemoryReadOnlyError",
+    "MalformedRecordError",
 ]
