@@ -41,9 +41,13 @@ from chronosmatch.shared_memory import (
 # ==============================================================================
 
 
-def _mp_producer_worker(filepath_str: str, num_orders: int) -> None:
+def _mp_producer_worker(
+    filepath_str: str, num_orders: int, ready_event: Any = None
+) -> None:
     """Worker process that writes a sequence of orders into a file-backed ring buffer."""
     with RingBufferProducer.create(filepath_str, capacity=16) as producer:
+        if ready_event is not None:
+            ready_event.set()
         for i in range(num_orders):
             order = Order(
                 order_id=f"mp-ord-{i:04d}",
@@ -57,8 +61,13 @@ def _mp_producer_worker(filepath_str: str, num_orders: int) -> None:
         producer.flush()
 
 
-def _mp_consumer_worker(filepath_str: str, num_orders: int, queue: mp.Queue) -> None:
+def _mp_consumer_worker(
+    filepath_str: str, num_orders: int, queue: mp.Queue, ready_event: Any = None
+) -> None:
     """Worker process that consumes orders from a file-backed ring buffer."""
+    if ready_event is not None:
+        if not ready_event.wait(timeout=5.0):
+            raise TimeoutError("Producer did not signal ready within 5.0 seconds")
     with RingBufferConsumer.open(filepath_str, read_only=False) as consumer:
         results = []
         for _ in range(num_orders):
@@ -338,19 +347,41 @@ class TestRingBufferWraparound:
         capacity = 5
         rb = RingBuffer(capacity=capacity)
         total_batches = 20
+        received: list[Order] = []
+        expected_orders = [
+            Order(f"np2-{i}", OrderSide.SELL, 50.0 + i, 5)
+            for i in range(60)
+        ]
 
-        # Put 3, get 2 in each iteration
+        put_idx = 0
+        get_idx = 0
         for batch in range(total_batches):
-            for j in range(3):
-                idx = batch * 3 + j
-                rb.put(Order(f"np2-{idx}", OrderSide.SELL, 50.0 + idx, 5))
-            for _ in range(2):
-                rb.get()
+            # Put 3 orders (occupancy reaches at most 4 <= 5)
+            for _ in range(3):
+                rb.put(expected_orders[put_idx])
+                put_idx += 1
+            # In the first batch get 2, in subsequent batches get 3
+            # This maintains resting orders across batches while wrapping around
+            get_count = 2 if batch == 0 else 3
+            for _ in range(get_count):
+                received.append(rb.get())
+                get_idx += 1
 
-        # Net remaining: total_batches * (3 - 2) = 20 items
-        # Wait, capacity is 5! If we put 3 and get 2, net growth is 1 item per batch.
-        # After 5 batches, occupied reaches 5!
-        # Let's adjust to keep within capacity:
+        # Drain the single resting order remaining in the buffer
+        while not rb.is_empty:
+            received.append(rb.get())
+            get_idx += 1
+
+        assert len(received) == len(expected_orders) == 60
+        for act, exp in zip(received, expected_orders):
+            assert act.order_id == exp.order_id
+            assert act.price == exp.price
+            assert act.side == exp.side
+            assert act.quantity == exp.quantity
+
+        assert rb.is_empty
+        assert rb.head == len(expected_orders)
+        assert rb.tail == len(expected_orders)
         rb.close()
 
     def test_batched_wraparound_within_capacity(self) -> None:
@@ -366,14 +397,15 @@ class TestRingBufferWraparound:
         put_idx = 0
         get_idx = 0
         while get_idx < len(expected_orders):
-            # Put up to 4 orders
-            chunk_put = min(4, len(expected_orders) - put_idx)
+            # Put up to 4 orders, bounded by available write capacity
+            chunk_put = min(4, rb.available_write, len(expected_orders) - put_idx)
             for _ in range(chunk_put):
                 rb.put(expected_orders[put_idx])
                 put_idx += 1
 
-            # Get up to 3 orders
-            chunk_get = min(3, len(expected_orders) - get_idx)
+            # If all orders have been put, drain remaining; otherwise consume up to 3 orders
+            max_get = len(expected_orders) - get_idx if put_idx == len(expected_orders) else 3
+            chunk_get = min(rb.available_read, max_get)
             for _ in range(chunk_get):
                 received.append(rb.get())
                 get_idx += 1
@@ -874,36 +906,58 @@ class TestMultiProcessConcurrency:
         filepath_str = str(filepath)
         num_orders = 25
         queue: mp.Queue = mp.Queue()
+        ready_event: mp.Event = mp.Event()
 
-        # Step 1: Run producer in child process
+        # Step 1: Instantiate producer and consumer processes
         producer_proc = mp.Process(
             target=_mp_producer_worker,
-            args=(filepath_str, num_orders),
+            args=(filepath_str, num_orders, ready_event),
         )
-        producer_proc.start()
-        producer_proc.join(timeout=6.0)
-        assert producer_proc.exitcode == 0
-
-        # Step 2: Run consumer in second child process
         consumer_proc = mp.Process(
             target=_mp_consumer_worker,
-            args=(filepath_str, num_orders, queue),
+            args=(filepath_str, num_orders, queue, ready_event),
         )
-        consumer_proc.start()
-        consumer_proc.join(timeout=6.0)
-        assert consumer_proc.exitcode == 0
 
-        # Step 3: Validate all orders received in FIFO order
-        results = queue.get(timeout=3.0)
-        assert len(results) == num_orders
+        try:
+            # Step 2: Start both processes concurrently so they make progress together
+            producer_proc.start()
+            consumer_proc.start()
 
-        for i, (order_id, side_val, price, quantity, seq) in enumerate(results):
-            assert order_id == f"mp-ord-{i:04d}"
-            assert side_val == ("BUY" if i % 2 == 0 else "SELL")
-            assert price == 100.0 + (i * 0.5)
-            assert quantity == 10 + i
-            assert seq == i + 1
+            # Step 3: Bounded joins with error handling
+            producer_proc.join(timeout=10.0)
+            consumer_proc.join(timeout=10.0)
 
-        # Clean up
-        if filepath.exists():
-            filepath.unlink()
+            # Ensure processes terminated cleanly and within timeout
+            assert not producer_proc.is_alive(), "Producer process timed out"
+            assert not consumer_proc.is_alive(), "Consumer process timed out"
+            assert producer_proc.exitcode == 0, f"Producer failed with exitcode {producer_proc.exitcode}"
+            assert consumer_proc.exitcode == 0, f"Consumer failed with exitcode {consumer_proc.exitcode}"
+
+            # Step 4: Validate all orders received in strict FIFO order
+            results = queue.get(timeout=3.0)
+            assert len(results) == num_orders
+
+            for i, (order_id, side_val, price, quantity, seq) in enumerate(results):
+                assert order_id == f"mp-ord-{i:04d}"
+                assert side_val == ("BUY" if i % 2 == 0 else "SELL")
+                assert price == 100.0 + (i * 0.5)
+                assert quantity == 10 + i
+                assert seq == i + 1
+        finally:
+            # Terminate and join child processes if any remain alive
+            if producer_proc.is_alive():
+                producer_proc.terminate()
+                producer_proc.join(timeout=1.0)
+            if consumer_proc.is_alive():
+                consumer_proc.terminate()
+                consumer_proc.join(timeout=1.0)
+
+            queue.close()
+            queue.join_thread()
+
+            # Clean up shared-memory backing file
+            if filepath.exists():
+                try:
+                    filepath.unlink()
+                except Exception:
+                    pass
