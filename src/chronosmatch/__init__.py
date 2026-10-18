@@ -12,6 +12,14 @@ from chronosmatch.binary_protocol import (
     encode_order,
     encode_order_into,
 )
+from chronosmatch.cython_engine import (
+    CythonMatchingEngine,
+    CythonOrderBook,
+    CythonPriceLevel,
+    IS_CYTHON_COMPILED,
+    get_compilation_status,
+    is_cython_compiled,
+)
 from chronosmatch.matching_engine import MatchingEngine, Trade, TradeEvent
 from chronosmatch.models import Order, OrderSide, Side
 from chronosmatch.order_book import (
@@ -109,5 +117,12 @@ __all__ = [
     "ProducerProcessError",
     "ConsumerProcessError",
     "ProcessTimeoutError",
+    "CythonMatchingEngine",
+    "CythonOrderBook",
+    "CythonPriceLevel",
+    "IS_CYTHON_COMPILED",
+    "is_cython_compiled",
+    "get_compilation_status",
 ]
+
 
