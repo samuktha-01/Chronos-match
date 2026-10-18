@@ -23,6 +23,17 @@ from chronosmatch.order_book import (
     OrderNotFoundError,
     PriceLevel,
 )
+from chronosmatch.producer_consumer import (
+    ConsumerProcess,
+    ConsumerProcessError,
+    OrderConsumer,
+    OrderPipeline,
+    OrderProducer,
+    ProcessIntegrationError,
+    ProcessTimeoutError,
+    ProducerProcess,
+    ProducerProcessError,
+)
 from chronosmatch.ring_buffer import (
     RingBuffer,
     RingBufferClosedError,
@@ -89,4 +100,14 @@ __all__ = [
     "RingBufferEmptyError",
     "RingBufferClosedError",
     "RingBufferConfigError",
+    "OrderProducer",
+    "OrderConsumer",
+    "ProducerProcess",
+    "ConsumerProcess",
+    "OrderPipeline",
+    "ProcessIntegrationError",
+    "ProducerProcessError",
+    "ConsumerProcessError",
+    "ProcessTimeoutError",
 ]
+
