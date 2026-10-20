@@ -36,6 +36,11 @@ from chronosmatch.market_simulator import (
 )
 from chronosmatch.matching_engine import MatchingEngine, Trade, TradeEvent
 from chronosmatch.models import Order, OrderSide, Side
+from chronosmatch.pipeline import (
+    TradingPipeline,
+    TradingPipelineMetrics,
+    create_pipeline,
+)
 from chronosmatch.order_book import (
     DuplicateOrderError,
     LimitOrderBook,
@@ -149,6 +154,9 @@ __all__ = [
     "BackpressureTimeoutError",
     "create_simulator",
     "run_simulator_sync",
+    "TradingPipeline",
+    "TradingPipelineMetrics",
+    "create_pipeline",
 ]
 
 

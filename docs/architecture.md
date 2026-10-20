@@ -348,29 +348,34 @@ The repository structure matches the architectural layers:
 | Layer | Technology | Actual Repository Path |
 | :--- | :--- | :--- |
 | **Project Packaging** | Python 3.12, PEP 621, Setuptools | [pyproject.toml](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/pyproject.toml) |
-| **Test Verification** | pytest 8.0+ | [tests/test_project_setup.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/tests/test_project_setup.py) |
 | **Package Initialization** | Python 3.12 | [src/chronosmatch/__init__.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/__init__.py) |
-| **Environment Configuration** | Dotenv Template | [.env.example](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/.env.example) |
-| **Architectural Spec** | Markdown / Mermaid | [docs/architecture.md](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/docs/architecture.md) |
-| **Planned IPC / Shm** | C / Cython / Win32 / POSIX mmap | `src/chronosmatch/ipc/` *(Planned Phase 2)* |
-| **Planned Ring Buffer** | C / Cython Lock-Free SPSC | `src/chronosmatch/ringbuffer/` *(Planned Phase 3)* |
-| **Planned LOB & Engine** | Cython (nogil), Intrusive List | `src/chronosmatch/engine/` *(Planned Phase 4)* |
-| **Planned Feed & Persistence**| Async WAL / Replay Harness | `src/chronosmatch/feed/`, `persistence/` *(Planned Phase 5)* |
-| **Planned Dashboard** | Rich / Textual Terminal UI | `src/chronosmatch/dashboard/` *(Planned Phase 6)* |
+| **Order Data Models** | Dataclasses, validation | [src/chronosmatch/models.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/models.py) |
+| **Binary Protocol** | 64-byte struct cache-aligned | [src/chronosmatch/binary_protocol.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/binary_protocol.py) |
+| **Shared-Memory IPC** | Win32 / POSIX mmap | [src/chronosmatch/shared_memory.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/shared_memory.py) |
+| **Lock-Free Ring Buffer** | SPSC circular buffer | [src/chronosmatch/ring_buffer.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/ring_buffer.py) |
+| **Producer-Consumer IPC** | Cross-process workers | [src/chronosmatch/producer_consumer.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/producer_consumer.py) |
+| **LOB & Price Ladder** | Deterministic L3 book | [src/chronosmatch/order_book.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/order_book.py) |
+| **Matching Engine Core** | FIFO Price-Time Priority | [src/chronosmatch/matching_engine.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/matching_engine.py) |
+| **Cython Acceleration Layer** | Optional C extension | [src/chronosmatch/cython_engine.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/cython_engine.py) |
+| **Synthetic Market Simulator** | Async Poisson / burst feed | [src/chronosmatch/market_simulator.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/market_simulator.py) |
+| **End-to-End Trading Pipeline** | Integrated orchestration | [src/chronosmatch/pipeline.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/pipeline.py) |
+| **Planned WAL Persistence** | Off-path append-only WAL | `src/chronosmatch/persistence/` *(Planned Next Phase)* |
+| **Planned Dashboard UI** | Rich / Textual Terminal UI | `src/chronosmatch/dashboard/` *(Planned Next Phase)* |
 
 ---
 
 ## 9. Implementation Status & Phase Roadmap
 
-Below is the definitive status breakdown distinguishing currently implemented foundation features from upcoming phases:
+Below is the definitive status breakdown distinguishing currently implemented components from upcoming phases:
 
 ```text
-Phase 1: Foundation & Packaging       [COMPLETED]
-Phase 2: Shared-Memory IPC & Schemas   [PLANNED]
-Phase 3: Lock-Free Ring Buffer         [PLANNED]
-Phase 4: Cython LOB & Matching Core    [PLANNED]
-Phase 5: Market Feed & Persistence     [PLANNED]
-Phase 6: Dashboard & Benchmarking      [PLANNED]
+Phase 1: Foundation & Packaging                  [COMPLETED]
+Phase 2: Binary Protocol & Shared-Memory IPC     [COMPLETED]
+Phase 3: Lock-Free SPSC Ring Buffer              [COMPLETED]
+Phase 4: Limit Order Book & Matching Engine Core [COMPLETED]
+Phase 5: Market Simulator & Pipeline Integration [COMPLETED]
+Phase 6: WAL Persistence & Crash Recovery        [PLANNED]
+Phase 7: Terminal Dashboard & Telemetry UI       [PLANNED]
 ```
 
 ### Phase Breakdown
@@ -378,11 +383,12 @@ Phase 6: Dashboard & Benchmarking      [PLANNED]
 | Phase | Milestone | Deliverables | Current Status |
 | :---: | :--- | :--- | :---: |
 | **1** | **Foundation Setup** | PEP 621 packaging, automated pytest test suite, `.env.example`, architectural specification. | **COMPLETED** |
-| **2** | **IPC & Message Schemas** | 64-byte `OrderMessage` struct in C/Cython, cross-platform shared-memory driver (`mmap`). | *Planned* |
-| **3** | **Lock-Free Ring Buffer** | SPSC ring buffer with memory fences, power-of-two modulo, cache-line separation tests. | *Planned* |
-| **4** | **LOB & Matching Core** | L3 price-time priority order book, intrusive linked list, compiled `nogil` matching loop. | *Planned* |
-| **5** | **Feed & Persistence** | Bursty synthetic order generator, off-path append-only WAL logging, deterministic replay. | *Planned* |
-| **6** | **Dashboard & Telemetry** | Real-time Rich/Textual terminal UI, nanosecond latency histogram, throughput benchmark suite. | *Planned* |
+| **2** | **IPC & Message Schemas** | 64-byte `ORDER_STRUCT` cache-aligned binary protocol, cross-platform shared-memory driver (`mmap`). | **COMPLETED** |
+| **3** | **Lock-Free Ring Buffer** | SPSC ring buffer with memory fences, power-of-two bitmasking, bounded blocking & non-blocking put/get. | **COMPLETED** |
+| **4** | **LOB & Matching Core** | L3 price-time priority order book, intrusive queue, Python baseline + optional Cython extension. | **COMPLETED** |
+| **5** | **Feed & Pipeline Integration**| Bursty Poisson market simulator, backpressure handling, end-to-end `TradingPipeline` integration. | **COMPLETED** |
+| **6** | **Trade WAL Persistence** | Off-path append-only WAL logging, deterministic replay harness, and crash recovery. | *Planned* |
+| **7** | **Dashboard & Telemetry** | Real-time Rich/Textual terminal UI, nanosecond latency histogram, live depth book visualization. | *Planned* |
 
 ---
 

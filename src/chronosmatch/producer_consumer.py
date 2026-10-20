@@ -599,6 +599,72 @@ def _default_consumer_worker(
                 pass
 
 
+def _matching_consumer_worker(
+    filepath_str: str,
+    expected_count: int | None,
+    trades_queue: Any = None,
+    ready_event: Any = None,
+    stop_event: Any = None,
+    error_queue: Any = None,
+    timeout: float | None = 5.0,
+    start_event: Any = None,
+    result_queue: Any = None,
+) -> None:
+    """Subprocess entry point for consuming orders and executing them in MatchingEngine."""
+    from chronosmatch.matching_engine import MatchingEngine
+
+    consumer: OrderConsumer | None = None
+    try:
+        if ready_event is not None:
+            if not ready_event.wait(timeout=10.0):
+                raise TimeoutError("Matching consumer timed out waiting for producer ready_event")
+
+        consumer = OrderConsumer(filepath_str)
+        engine = MatchingEngine()
+        if start_event is not None:
+            start_event.set()
+
+        received_count = 0
+        idle_start = time.monotonic()
+
+        while True:
+            if expected_count is not None and received_count >= expected_count:
+                break
+            if stop_event is not None and stop_event.is_set() and consumer.is_empty:
+                break
+
+            try:
+                order = consumer.receive(block=True, timeout=0.05)
+                received_count += 1
+                idle_start = time.monotonic()
+                trades = engine.process_order(order)
+                if result_queue is not None:
+                    result_queue.put(order)
+                if trades_queue is not None and trades:
+                    for trade in trades:
+                        trades_queue.put(trade)
+            except RingBufferEmptyError:
+                if stop_event is not None and stop_event.is_set() and consumer.is_empty:
+                    break
+                if timeout is not None and (time.monotonic() - idle_start) >= timeout:
+                    raise RingBufferEmptyError(
+                        f"Matching consumer timed out after {timeout:.2f}s waiting for order #{received_count + 1}"
+                    )
+    except Exception as e:
+        if error_queue is not None:
+            try:
+                error_queue.put((type(e).__name__, str(e), traceback.format_exc()))
+            except Exception:
+                pass
+        raise
+    finally:
+        if consumer is not None:
+            try:
+                consumer.close()
+            except Exception:
+                pass
+
+
 # ==============================================================================
 # Process Subclasses
 # ==============================================================================
@@ -771,6 +837,8 @@ class OrderPipeline:
         self._start_event: Any = mp.Event()
         self._error_queue: mp.Queue = mp.Queue()
         self._result_queue: mp.Queue = mp.Queue()
+        self._trades_queue: mp.Queue = mp.Queue()
+        self._buffered_trades: list[Any] = []
 
         self._local_producer: OrderProducer | None = None
         self._local_consumer: OrderConsumer | None = None
@@ -851,6 +919,53 @@ class OrderPipeline:
         self._consumer_proc.start()
         return self._consumer_proc
 
+    def start_matching_consumer(
+        self,
+        expected_count: int | None = None,
+        timeout: float = 5.0,
+        trades_queue: Any = None,
+    ) -> ConsumerProcess:
+        """Start consumer process that executes orders against MatchingEngine in a separate process.
+
+        Args:
+            expected_count: Total orders expected to process before shutdown.
+            timeout: Maximum idle seconds waiting for next order.
+            trades_queue: Optional explicit Queue for executed trades (defaults to pipeline trades_queue).
+
+        Returns:
+            ConsumerProcess instance.
+        """
+        self._ensure_buffer_initialized()
+        if trades_queue is not None:
+            self._trades_queue = trades_queue
+
+        kwargs = {
+            "filepath_str": str(self._filepath),
+            "expected_count": expected_count,
+            "trades_queue": self._trades_queue,
+            "ready_event": self._ready_event,
+            "stop_event": self._stop_event,
+            "error_queue": self._error_queue,
+            "timeout": timeout,
+            "start_event": self._start_event,
+            "result_queue": self._result_queue,
+        }
+
+        self._consumer_proc = ConsumerProcess(
+            filepath=self._filepath,
+            expected_count=expected_count,
+            result_queue=self._result_queue,
+            ready_event=self._ready_event,
+            stop_event=self._stop_event,
+            error_queue=self._error_queue,
+            timeout=timeout,
+            start_event=self._start_event,
+            target=_matching_consumer_worker,
+            kwargs=kwargs,
+        )
+        self._consumer_proc.start()
+        return self._consumer_proc
+
     def start(
         self,
         orders: list[Order] | None = None,
@@ -907,11 +1022,17 @@ class OrderPipeline:
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
-            # Drain result queue into buffered results to prevent pipe deadlock
+            # Drain queues into buffered results to prevent pipe deadlock
             if self._result_queue is not None:
                 while True:
                     try:
                         self._buffered_results.append(self._result_queue.get_nowait())
+                    except Exception:
+                        break
+            if self._trades_queue is not None:
+                while True:
+                    try:
+                        self._buffered_trades.append(self._trades_queue.get_nowait())
                     except Exception:
                         break
 
@@ -925,6 +1046,12 @@ class OrderPipeline:
             while True:
                 try:
                     self._buffered_results.append(self._result_queue.get_nowait())
+                except Exception:
+                    break
+        if self._trades_queue is not None:
+            while True:
+                try:
+                    self._buffered_trades.append(self._trades_queue.get_nowait())
                 except Exception:
                     break
 
@@ -978,6 +1105,25 @@ class OrderPipeline:
                 break
         return results
 
+    def get_trades(self, timeout: float = 0.5) -> list[Any]:
+        """Collect and return all executed trades accumulated in the trades queue.
+
+        Args:
+            timeout: Per-item queue read timeout.
+
+        Returns:
+            List of executed Trade instances.
+        """
+        trades: list[Any] = list(self._buffered_trades)
+        self._buffered_trades.clear()
+        if self._trades_queue is not None:
+            while True:
+                try:
+                    trades.append(self._trades_queue.get(timeout=0.01))
+                except Exception:
+                    break
+        return trades
+
     def drain_results(self, timeout: float = 10.0) -> list[Order]:
         """Join child processes and retrieve all results.
 
@@ -989,6 +1135,18 @@ class OrderPipeline:
         """
         self.join(timeout=timeout)
         return self.get_results(timeout=1.0)
+
+    def drain_trades(self, timeout: float = 10.0) -> list[Any]:
+        """Join child processes and retrieve all executed trades.
+
+        Args:
+            timeout: Timeout for join.
+
+        Returns:
+            List of executed Trade instances.
+        """
+        self.join(timeout=timeout)
+        return self.get_trades(timeout=1.0)
 
 
     def cleanup(self) -> None:
@@ -1022,7 +1180,7 @@ class OrderPipeline:
             self._local_consumer = None
 
         # Close queues
-        for q in (self._error_queue, self._result_queue):
+        for q in (self._error_queue, self._result_queue, self._trades_queue):
             try:
                 q.close()
                 q.join_thread()
