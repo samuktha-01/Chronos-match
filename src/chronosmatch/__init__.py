@@ -20,6 +20,20 @@ from chronosmatch.cython_engine import (
     get_compilation_status,
     is_cython_compiled,
 )
+from chronosmatch.market_simulator import (
+    BackpressureMode,
+    BackpressureTimeoutError,
+    MarketFeedConfig,
+    MarketSimulator,
+    MarketSimulatorError,
+    OrderAction,
+    OrderCancel,
+    SimulationMode,
+    SimulatorConfigError,
+    SimulatorMetrics,
+    create_simulator,
+    run_simulator_sync,
+)
 from chronosmatch.matching_engine import MatchingEngine, Trade, TradeEvent
 from chronosmatch.models import Order, OrderSide, Side
 from chronosmatch.order_book import (
@@ -123,6 +137,18 @@ __all__ = [
     "IS_CYTHON_COMPILED",
     "is_cython_compiled",
     "get_compilation_status",
+    "MarketSimulator",
+    "MarketFeedConfig",
+    "SimulationMode",
+    "BackpressureMode",
+    "OrderAction",
+    "OrderCancel",
+    "SimulatorMetrics",
+    "MarketSimulatorError",
+    "SimulatorConfigError",
+    "BackpressureTimeoutError",
+    "create_simulator",
+    "run_simulator_sync",
 ]
 
 

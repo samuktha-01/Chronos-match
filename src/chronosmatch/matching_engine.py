@@ -232,6 +232,20 @@ class MatchingEngine:
     match_order = process_order
     match = process_order
 
+    def cancel_order(self, order_id: str) -> Order:
+        """Cancel and remove an order from the underlying order book.
+
+        Args:
+            order_id: Identifier of the resting order to cancel.
+
+        Returns:
+            The removed Order instance.
+
+        Raises:
+            OrderNotFoundError: If the order_id is not found in the book.
+        """
+        return self.order_book.cancel_order(order_id)
+
     @property
     def trades(self) -> list[Trade]:
         """Return defensive shallow copy of all trade executions."""

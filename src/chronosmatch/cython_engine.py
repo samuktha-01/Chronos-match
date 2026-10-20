@@ -286,6 +286,8 @@ class _PyCythonOrderBook:
 
         return removed_order
 
+    cancel_order = remove_order
+
     def reduce_order_quantity(self, order_id: str, filled_qty: int) -> Order:
         """Reduce resting order quantity by filled_qty."""
         if order_id not in self._order_id_to_price:
@@ -489,9 +491,13 @@ class _PyCythonMatchingEngine:
 
         return trades
 
-    # Method aliases matching Python reference
+    # Method aliases for flexibility
     match_order = process_order
     match = process_order
+
+    def cancel_order(self, order_id: str) -> Order:
+        """Cancel and remove an order from the underlying order book."""
+        return self.order_book.remove_order(order_id)
 
     @property
     def trades(self) -> list[Trade]:
