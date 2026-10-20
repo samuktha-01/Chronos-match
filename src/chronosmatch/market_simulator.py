@@ -114,13 +114,15 @@ class SimulatorMetrics:
     total_backpressure_wait_seconds: float = 0.0
     start_time_ns: int | None = None
     stop_time_ns: int | None = None
+    wall_start_time_ns: int | None = None
+    wall_stop_time_ns: int | None = None
 
     @property
     def elapsed_seconds(self) -> float:
-        """Total elapsed duration in seconds."""
+        """Total elapsed duration in seconds measured via high-resolution monotonic timer."""
         if self.start_time_ns is None:
             return 0.0
-        end_ns = self.stop_time_ns if self.stop_time_ns is not None else time.time_ns()
+        end_ns = self.stop_time_ns if self.stop_time_ns is not None else time.perf_counter_ns()
         return max(0.0, (end_ns - self.start_time_ns) / 1_000_000_000.0)
 
     @property
@@ -146,6 +148,10 @@ class SimulatorMetrics:
             "total_backpressure_wait_seconds": self.total_backpressure_wait_seconds,
             "elapsed_seconds": self.elapsed_seconds,
             "effective_rate": self.effective_rate,
+            "start_time_ns": self.start_time_ns,
+            "stop_time_ns": self.stop_time_ns,
+            "wall_start_time_ns": self.wall_start_time_ns,
+            "wall_stop_time_ns": self.wall_stop_time_ns,
         }
 
     def reset(self) -> None:
@@ -162,6 +168,8 @@ class SimulatorMetrics:
         self.total_backpressure_wait_seconds = 0.0
         self.start_time_ns = None
         self.stop_time_ns = None
+        self.wall_start_time_ns = None
+        self.wall_stop_time_ns = None
 
 
 # ==============================================================================
@@ -809,7 +817,8 @@ class MarketSimulator:
             Populated SimulatorMetrics.
         """
         self._is_running = True
-        self.metrics.start_time_ns = time.time_ns()
+        self.metrics.wall_start_time_ns = time.time_ns()
+        self.metrics.start_time_ns = time.perf_counter_ns()
         count = 0
 
         try:
@@ -865,7 +874,11 @@ class MarketSimulator:
             raise
         finally:
             self._is_running = False
-            self.metrics.stop_time_ns = time.time_ns()
+            self.metrics.wall_stop_time_ns = time.time_ns()
+            stop_ns = time.perf_counter_ns()
+            if self.metrics.start_time_ns is not None and stop_ns <= self.metrics.start_time_ns:
+                stop_ns = self.metrics.start_time_ns + 1
+            self.metrics.stop_time_ns = stop_ns
 
         return self.metrics
 
