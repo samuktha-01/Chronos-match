@@ -2,8 +2,8 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-4%20passed-brightgreen.svg)](tests/)
-[![Architecture Status](https://img.shields.io/badge/status-foundation%20phase%201-orange.svg)](docs/architecture.md)
+[![Tests](https://img.shields.io/badge/tests-513%20passed-brightgreen.svg)](tests/)
+[![Architecture Status](https://img.shields.io/badge/status-phase%2012%20complete-brightgreen.svg)](docs/architecture.md)
 
 An in-memory, HFT-style simulated order-matching engine and low-latency systems testbed built with mechanical sympathy, zero-copy shared-memory IPC, lock-free ring buffers, and a deterministic limit order book.
 
@@ -112,11 +112,12 @@ ChronosMatch adopts a staged, test-driven engineering approach. Below is the exp
 | **Project Foundation & Packaging** | Phase 1 | **Implemented** | PEP 621 compliant [pyproject.toml](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/pyproject.toml), package imports, versioning (`0.1.0`), automated pytest test suite. |
 | **Environment Configuration** | Phase 1 | **Implemented** | [.env.example](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/.env.example) configuration template with deployment settings. |
 | **System Architecture Spec** | Phase 1 | **Implemented** | Comprehensive technical specification in [docs/architecture.md](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/docs/architecture.md). |
-| **Shared-Memory IPC & Message Schemas** | Phase 2 | *Planned* | 64-byte `OrderMessage` binary struct definitions, cross-platform shared memory (`mmap`). |
-| **Lock-Free Ring Buffer** | Phase 3 | *Planned* | SPSC/MPSC circular ring buffer with atomic memory barriers and power-of-two bitmask indexing. |
-| **Cython LOB & Matching Core** | Phase 4 | *Planned* | L3 price-time priority order book, intrusive order linked lists, compiled C/Cython execution loop. |
-| **Market Feed & Trade Persistence** | Phase 5 | *Planned* | Poisson/burst order feed generator, off-path append-only write-ahead log (WAL) for trade persistence. |
-| **Terminal Dashboard & Telemetry** | Phase 6 | *Planned* | Terminal UI (Rich/Textual), tick-to-trade latency histogram (p50/p90/p99/p99.9), benchmarking harness. |
+| **Shared-Memory IPC & Message Schemas** | Phase 2 | **Implemented** | 64-byte `ORDER_STRUCT` cache-aligned binary protocol, cross-platform shared memory (`mmap`). |
+| **Lock-Free Ring Buffer** | Phase 3 | **Implemented** | SPSC circular ring buffer with atomic memory barriers, power-of-two bitmask indexing, bounded put/get. |
+| **Cython LOB & Matching Core** | Phase 4 | **Implemented** | L3 price-time priority order book, intrusive queue, Python baseline + compiled Cython extension. |
+| **Market Feed & Pipeline Integration** | Phase 5 | **Implemented** | Bursty Poisson market feed simulator, backpressure handling, end-to-end `TradingPipeline` integration. |
+| **Trade Persistence & Crash Recovery** | Phase 12 | **Implemented** | Append-only binary WAL (CRC32, LSN), `TradeStore`, `DurabilityPolicy`, deterministic replay and crash recovery. |
+| **Terminal Dashboard & Telemetry** | Phase 13 | *Planned* | Terminal UI (Rich/Textual), real-time L2 depth ladder, trade tape, tick-to-trade latency histogram. |
 
 ---
 

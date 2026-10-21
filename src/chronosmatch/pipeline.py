@@ -35,6 +35,12 @@ from chronosmatch.market_simulator import (
 )
 from chronosmatch.matching_engine import MatchingEngine, Trade
 from chronosmatch.models import Order, OrderSide
+from chronosmatch.persistence import (
+    DurabilityPolicy,
+    RecoveryManager,
+    TradeStore,
+    WriteAheadLog,
+)
 from chronosmatch.order_book import DuplicateOrderError, LimitOrderBook, OrderNotFoundError
 from chronosmatch.producer_consumer import OrderConsumer, OrderProducer
 from chronosmatch.ring_buffer import (
@@ -149,6 +155,10 @@ class TradingPipeline:
         filepath: str | Path | None = None,
         engine: Any = None,
         ring_buffer: RingBuffer | None = None,
+        wal_path: str | Path | None = None,
+        wal: WriteAheadLog | None = None,
+        trade_store: TradeStore | None = None,
+        durability_policy: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
     ) -> None:
         """Initialize the end-to-end trading pipeline.
 
@@ -158,10 +168,30 @@ class TradingPipeline:
             filepath: Optional backing file path for shared memory (None for anonymous).
             engine: Matching engine instance (defaults to Python MatchingEngine).
             ring_buffer: Existing RingBuffer instance to attach to.
+            wal_path: Optional file path to append-only Write-Ahead Log (WAL).
+            wal: Existing WriteAheadLog instance.
+            trade_store: Optional TradeStore instance for trade persistence.
+            durability_policy: Durability guarantee for disk writes.
         """
         self.config: MarketFeedConfig = config if config is not None else MarketFeedConfig()
         self.metrics: TradingPipelineMetrics = TradingPipelineMetrics()
         self.engine: Any = engine if engine is not None else MatchingEngine()
+        self._durability_policy = DurabilityPolicy(durability_policy)
+
+        # Persistence setup
+        self._owns_wal: bool = False
+        self._wal: WriteAheadLog | None
+        if wal is not None:
+            self._wal = wal
+            self._owns_wal = False
+        elif wal_path is not None:
+            self._wal = WriteAheadLog(wal_path, durability=self._durability_policy)
+            self._owns_wal = True
+        else:
+            self._wal = None
+            self._owns_wal = False
+
+        self._trade_store = trade_store
 
         self._owns_ring_buffer: bool = ring_buffer is None
         self._ring_buffer: RingBuffer
@@ -209,11 +239,18 @@ class TradingPipeline:
         consumed_order = self._consumer.get_nowait()
         self.metrics.orders_processed += 1
 
+        if self._wal is not None:
+            self._wal.append_order(consumed_order)
+
         trades: list[Trade] = []
         try:
             trades = self.engine.process_order(consumed_order)
             self.metrics.trades_executed += len(trades)
             self.metrics.volume_executed += sum(t.quantity for t in trades)
+            if self._wal is not None and trades:
+                self._wal.append_trades(trades)
+            if self._trade_store is not None and trades:
+                self._trade_store.append_trades(trades)
         except DuplicateOrderError:
             self.metrics.duplicate_orders += 1
             raise
@@ -269,6 +306,9 @@ class TradingPipeline:
             OrderNotFoundError: If order_id is not resting in the book.
         """
         self._check_closed()
+        if self._wal is not None:
+            self._wal.append_cancel(order_id)
+
         if hasattr(self.engine, "cancel_order"):
             cancelled = self.engine.cancel_order(order_id)
         elif hasattr(self.engine, "order_book") and hasattr(self.engine.order_book, "cancel_order"):
@@ -312,6 +352,9 @@ class TradingPipeline:
             except RingBufferEmptyError:
                 break
 
+            if self._wal is not None:
+                self._wal.append_order(order)
+
             self.metrics.orders_processed += 1
             processed += 1
 
@@ -319,6 +362,10 @@ class TradingPipeline:
                 trades = self.engine.process_order(order)
                 self.metrics.trades_executed += len(trades)
                 self.metrics.volume_executed += sum(t.quantity for t in trades)
+                if self._wal is not None and trades:
+                    self._wal.append_trades(trades)
+                if self._trade_store is not None and trades:
+                    self._trade_store.append_trades(trades)
             except DuplicateOrderError:
                 self.metrics.duplicate_orders += 1
             except Exception:
@@ -378,6 +425,9 @@ class TradingPipeline:
                         await asyncio.sleep(0.0005)
                         continue
 
+                    if self._wal is not None:
+                        self._wal.append_order(order)
+
                     self.metrics.orders_processed += 1
                     processed += 1
 
@@ -385,6 +435,10 @@ class TradingPipeline:
                         trades = self.engine.process_order(order)
                         self.metrics.trades_executed += len(trades)
                         self.metrics.volume_executed += sum(t.quantity for t in trades)
+                        if self._wal is not None and trades:
+                            self._wal.append_trades(trades)
+                        if self._trade_store is not None and trades:
+                            self._trade_store.append_trades(trades)
                     except DuplicateOrderError:
                         self.metrics.duplicate_orders += 1
                 else:
@@ -489,6 +543,18 @@ class TradingPipeline:
             except Exception:
                 pass
 
+        if self._owns_wal and self._wal is not None:
+            try:
+                self._wal.close()
+            except Exception:
+                pass
+
+        if self._trade_store is not None:
+            try:
+                self._trade_store.close()
+            except Exception:
+                pass
+
     def cleanup(self) -> None:
         """Close handles and permanently unlink the backing file if file-backed."""
         self.close()
@@ -518,6 +584,21 @@ class TradingPipeline:
     def simulator(self) -> MarketSimulator:
         """MarketSimulator instance."""
         return self._simulator
+
+    @property
+    def wal(self) -> WriteAheadLog | None:
+        """Active WriteAheadLog instance, or None if persistence is disabled."""
+        return self._wal
+
+    @property
+    def trade_store(self) -> TradeStore | None:
+        """Active TradeStore instance, or None if not configured."""
+        return self._trade_store
+
+    @property
+    def durability_policy(self) -> DurabilityPolicy:
+        """Active DurabilityPolicy for persistence."""
+        return self._durability_policy
 
     @property
     def trades(self) -> list[Trade]:
@@ -559,6 +640,50 @@ class TradingPipeline:
         """True if the pipeline has been closed."""
         return self._is_closed or self._ring_buffer.is_closed
 
+    @classmethod
+    def recover(
+        cls,
+        wal_path: str | Path,
+        config: MarketFeedConfig | None = None,
+        *,
+        trade_store_path: str | Path | None = None,
+        capacity: int = 1024,
+        filepath: str | Path | None = None,
+        strict: bool = False,
+        durability_policy: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
+    ) -> TradingPipeline:
+        """Recover engine state from a Write-Ahead Log and initialize a ready pipeline.
+
+        Args:
+            wal_path: Path to the WAL log file.
+            config: MarketFeedConfig for synthetic order generation.
+            trade_store_path: Optional path to trade store.
+            capacity: RingBuffer capacity.
+            filepath: Shared memory backing filepath.
+            strict: Strict recovery mode.
+            durability_policy: Durability policy for post-recovery operations.
+
+        Returns:
+            Initialized TradingPipeline with reconstructed engine state and attached WAL.
+        """
+        recovery_mgr = RecoveryManager(wal_path=wal_path, trade_store_path=trade_store_path, strict=strict)
+        result = recovery_mgr.recover()
+        wal = WriteAheadLog(wal_path, durability=durability_policy)
+        trade_store = (
+            TradeStore(trade_store_path, durability=durability_policy)
+            if trade_store_path is not None
+            else None
+        )
+        return cls(
+            config=config,
+            capacity=capacity,
+            filepath=filepath,
+            engine=result.engine,
+            wal=wal,
+            trade_store=trade_store,
+            durability_policy=durability_policy,
+        )
+
     def __enter__(self) -> Self:
         return self
 
@@ -583,6 +708,10 @@ def create_pipeline(
     capacity: int = 1024,
     filepath: str | Path | None = None,
     engine: Any = None,
+    wal_path: str | Path | None = None,
+    wal: WriteAheadLog | None = None,
+    trade_store: TradeStore | None = None,
+    durability_policy: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
 ) -> TradingPipeline:
     """Convenience factory function to instantiate a TradingPipeline."""
     return TradingPipeline(
@@ -590,4 +719,8 @@ def create_pipeline(
         capacity=capacity,
         filepath=filepath,
         engine=engine,
+        wal_path=wal_path,
+        wal=wal,
+        trade_store=trade_store,
+        durability_policy=durability_policy,
     )

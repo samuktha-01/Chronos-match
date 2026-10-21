@@ -153,14 +153,24 @@ flowchart TD
   - **Market Orders**: Match aggressively across resting depth until filled; any unfilled portion rejected/cancelled if depth exhausted.
   - **Partial Fills**: In-place quantity decrement of resting order node at the head of queue.
 
-### 3.6 Component 6: Trade Persistence
+### 3.6 Component 6: Trade Persistence & Crash Recovery
 
-- **Primary Responsibility**: Captures an immutable audit log of all trade executions, order cancellations, and book snapshots.
-- **Isolation Guarantee**: Completely separated from the critical matching loop.
-- **Mechanism**:
-  - The Cython matching engine writes execution records (`TradeEvent`) to an asynchronous egress ring buffer.
-  - A dedicated background persistence thread reads batches from the egress ring buffer and writes sequentially to an append-only Write-Ahead Log (WAL) or SQLite database.
-  - Disk I/O stalls, filesystem flushes, and page allocations never block the matching loop.
+- **Primary Responsibility**: Captures an immutable, append-only audit log of all order submissions, cancellations, and trade executions, enabling deterministic state recovery after unexpected process or system termination.
+- **Binary WAL Framing & Layout**:
+  - **File Header (32 Bytes)**: Magic bytes (`b"CMWL"`), format version (`uint16=1`), header size (`uint16=32`), creation timestamp ($T_0$), and active durability policy code.
+  - **Record Frame Header (24 Bytes)**: Record magic (`b"CWAL"`), monotonic Log Sequence Number (`LSN uint64 >= 1`), record type (`uint8: 1=ORDER, 2=CANCEL, 3=TRADE, 4=CHECKPOINT`), flags (`uint8`), payload length (`uint32`), and CRC32 checksum (`uint32`).
+  - **Payloads**: Orders (fixed 64-byte `ORDER_STRUCT`), Cancellations (40 bytes), Trades (128-byte dual-cache-line struct with stable IDs and price scaling), and Checkpoints (24 bytes).
+- **Durability Policies**:
+  - `IMMEDIATE_SYNC`: Synchronously flushes operating system page cache and calls `os.fsync()` on physical disk per record before acknowledging. Highest durability (zero data loss across OS/power crashes), higher latency per write.
+  - `FLUSH_ON_WRITE`: Flushes each record to the OS page cache (`file.flush()`) without blocking for disk spindle/SSD sync. Survives application-level crashes; uncommitted dirty pages vulnerable to OS panics or power outages.
+  - `ASYNC_BUFFERED`: Decouples persistence from the latency-sensitive matching loop using `AsyncPersistenceWorker`. Writes are queued in memory and batched to disk in the background, keeping matching path latency sub-microsecond.
+- **Crash Recovery & Replay Guarantees**:
+  - `RecoveryManager`: Replays valid sequenced WAL records through a fresh `MatchingEngine`.
+  - **State Reconstructed**: Limit Order Book bids, asks, price levels, and FIFO queue order priority; in-memory trade history and trade counter.
+  - **Duplicate Replay Protection**: Existing persisted trades are deduplicated against replayed executions, preventing silent duplicate trade emission.
+  - **Truncated & Corrupt Record Resilience**: Detects incomplete trailing records from mid-write crashes, reporting diagnostic warnings and safely truncating corrupted trailing bytes via `repair_wal()`. Payload bit-flips are trapped via CRC32 validation.
+- **Trade Persistence**:
+  - `TradeStore`: Dedicated storage repository indexing trades by stable identifier and participating order IDs, providing historical queries and aggregated volume telemetry.
 
 ### 3.7 Component 7: Terminal Dashboard
 
@@ -359,7 +369,7 @@ The repository structure matches the architectural layers:
 | **Cython Acceleration Layer** | Optional C extension | [src/chronosmatch/cython_engine.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/cython_engine.py) |
 | **Synthetic Market Simulator** | Async Poisson / burst feed | [src/chronosmatch/market_simulator.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/market_simulator.py) |
 | **End-to-End Trading Pipeline** | Integrated orchestration | [src/chronosmatch/pipeline.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/pipeline.py) |
-| **Planned WAL Persistence** | Off-path append-only WAL | `src/chronosmatch/persistence/` *(Planned Next Phase)* |
+| **Trade-Event Persistence & WAL** | Append-only binary WAL, TradeStore, Crash Recovery | [src/chronosmatch/persistence.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/persistence.py) |
 | **Planned Dashboard UI** | Rich / Textual Terminal UI | `src/chronosmatch/dashboard/` *(Planned Next Phase)* |
 
 ---
@@ -374,7 +384,7 @@ Phase 2: Binary Protocol & Shared-Memory IPC     [COMPLETED]
 Phase 3: Lock-Free SPSC Ring Buffer              [COMPLETED]
 Phase 4: Limit Order Book & Matching Engine Core [COMPLETED]
 Phase 5: Market Simulator & Pipeline Integration [COMPLETED]
-Phase 6: WAL Persistence & Crash Recovery        [PLANNED]
+Phase 6: WAL Persistence & Crash Recovery        [COMPLETED]
 Phase 7: Terminal Dashboard & Telemetry UI       [PLANNED]
 ```
 
@@ -387,7 +397,7 @@ Phase 7: Terminal Dashboard & Telemetry UI       [PLANNED]
 | **3** | **Lock-Free Ring Buffer** | SPSC ring buffer with memory fences, power-of-two bitmasking, bounded blocking & non-blocking put/get. | **COMPLETED** |
 | **4** | **LOB & Matching Core** | L3 price-time priority order book, intrusive queue, Python baseline + optional Cython extension. | **COMPLETED** |
 | **5** | **Feed & Pipeline Integration**| Bursty Poisson market simulator, backpressure handling, end-to-end `TradingPipeline` integration. | **COMPLETED** |
-| **6** | **Trade WAL Persistence** | Off-path append-only WAL logging, deterministic replay harness, and crash recovery. | *Planned* |
+| **6** | **Trade WAL Persistence** | Off-path append-only WAL logging, deterministic replay harness, and crash recovery. | **COMPLETED** |
 | **7** | **Dashboard & Telemetry** | Real-time Rich/Textual terminal UI, nanosecond latency histogram, live depth book visualization. | *Planned* |
 
 ---

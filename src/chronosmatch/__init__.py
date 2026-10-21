@@ -36,6 +36,27 @@ from chronosmatch.market_simulator import (
 )
 from chronosmatch.matching_engine import MatchingEngine, Trade, TradeEvent
 from chronosmatch.models import Order, OrderSide, Side
+from chronosmatch.persistence import (
+    AsyncPersistenceWorker,
+    CancelRecord,
+    CheckpointRecord,
+    DuplicateTradeError,
+    DurabilityPolicy,
+    PersistedMatchingEngine,
+    PersistenceError,
+    RecoveryError,
+    RecoveryManager,
+    RecoveryResult,
+    TradeStore,
+    WALClosedError,
+    WALCorruptedRecordError,
+    WALError,
+    WALRecord,
+    WALRecordType,
+    WALTruncatedRecordError,
+    WALWriteError,
+    WriteAheadLog,
+)
 from chronosmatch.pipeline import (
     TradingPipeline,
     TradingPipelineMetrics,
@@ -157,6 +178,25 @@ __all__ = [
     "TradingPipeline",
     "TradingPipelineMetrics",
     "create_pipeline",
+    "DurabilityPolicy",
+    "WALRecordType",
+    "WALRecord",
+    "CancelRecord",
+    "CheckpointRecord",
+    "RecoveryResult",
+    "WriteAheadLog",
+    "TradeStore",
+    "AsyncPersistenceWorker",
+    "RecoveryManager",
+    "PersistedMatchingEngine",
+    "PersistenceError",
+    "WALError",
+    "WALCorruptedRecordError",
+    "WALTruncatedRecordError",
+    "WALClosedError",
+    "WALWriteError",
+    "RecoveryError",
+    "DuplicateTradeError",
 ]
 
 
