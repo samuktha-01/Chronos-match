@@ -26,6 +26,11 @@ from chronosmatch.dashboard.terminal import (
     strip_ansi,
     visible_len,
 )
+from chronosmatch.dashboard.pipeline_runner import (
+    LatencyInstrumentedEngine,
+    PipelineDashboardRunner,
+    run_pipeline_with_dashboard,
+)
 
 __all__ = [
     "LatencyStats",
@@ -50,4 +55,7 @@ __all__ = [
     "format_utilization_bar",
     "format_wall_clock",
     "format_wall_time",
+    "LatencyInstrumentedEngine",
+    "PipelineDashboardRunner",
+    "run_pipeline_with_dashboard",
 ]

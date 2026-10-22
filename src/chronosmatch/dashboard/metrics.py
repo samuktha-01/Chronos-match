@@ -292,6 +292,7 @@ class DashboardMetricsSnapshot:
     best_ask: float | int | Decimal | None
     spread: float | int | Decimal | None
     order_book_depth_levels: int | None = None
+    is_cython_accelerated: bool = False
     source_name: str = "ChronosMatch"
 
     def to_dict(self) -> dict[str, Any]:
@@ -322,6 +323,7 @@ class DashboardMetricsSnapshot:
             "best_ask": float(self.best_ask) if self.best_ask is not None else None,
             "spread": float(self.spread) if self.spread is not None else None,
             "order_book_depth_levels": self.order_book_depth_levels,
+            "is_cython_accelerated": self.is_cython_accelerated,
             "source_name": self.source_name,
         }
 
@@ -568,6 +570,16 @@ class DashboardMetricsCollector:
             if proc_orders is not None:
                 self._prev_processed_orders = proc_orders
                 self._prev_snapshot_time_ns = now_perf_ns
+            # 9. Acceleration Status
+            is_cython = False
+            if self._pipeline is not None and hasattr(self._pipeline, "is_cython_accelerated"):
+                is_cython = bool(self._pipeline.is_cython_accelerated)
+            elif self._engine is not None and hasattr(self._engine, "is_cython_accelerated"):
+                is_cython = bool(self._engine.is_cython_accelerated)
+            elif self._engine is not None:
+                from chronosmatch.cython_engine import is_cython_compiled, CythonMatchingEngine
+
+                is_cython = is_cython_compiled() and isinstance(self._engine, CythonMatchingEngine)
 
             return DashboardMetricsSnapshot(
                 timestamp_ns=now_perf_ns,
@@ -595,6 +607,7 @@ class DashboardMetricsCollector:
                 best_ask=best_ask,
                 spread=spread,
                 order_book_depth_levels=depth_levels,
+                is_cython_accelerated=is_cython,
                 source_name=self.source_name,
             )
 
@@ -650,25 +663,50 @@ class DashboardMetricsCollector:
 
     def _resolve_orders_generated(self) -> int | None:
         if self._pipeline is not None and hasattr(self._pipeline, "metrics"):
-            return self._pipeline.metrics.orders_generated
+            gen = self._pipeline.metrics.orders_generated
+            if gen == 0 and hasattr(self._pipeline, "simulator") and hasattr(self._pipeline.simulator, "metrics"):
+                sim_gen = getattr(self._pipeline.simulator.metrics, "orders_generated", 0)
+                if sim_gen > 0:
+                    return sim_gen
+            return gen
         if self._simulator is not None and hasattr(self._simulator, "metrics"):
             return self._simulator.metrics.orders_generated
         return self._manual_orders_generated
 
     def _resolve_orders_published(self) -> int | None:
         if self._pipeline is not None and hasattr(self._pipeline, "metrics"):
-            return self._pipeline.metrics.orders_published
+            pub = self._pipeline.metrics.orders_published
+            if pub > 0:
+                return pub
+            if not getattr(self._pipeline, "is_closed", False):
+                rb = getattr(self._pipeline, "ring_buffer", None)
+                if rb is not None and not getattr(rb, "is_closed", False):
+                    try:
+                        return rb.head
+                    except Exception:
+                        pass
+            return pub
         if self._simulator is not None and hasattr(self._simulator, "metrics"):
             return self._simulator.metrics.orders_published
-        if self._ring_buffer is not None and hasattr(self._ring_buffer, "head"):
-            return self._ring_buffer.head
+        if self._ring_buffer is not None and not getattr(self._ring_buffer, "is_closed", False):
+            try:
+                return self._ring_buffer.head
+            except Exception:
+                return None
         return self._manual_orders_published
 
     def _resolve_orders_consumed(self) -> int | None:
-        if self._pipeline is not None and hasattr(self._pipeline, "ring_buffer"):
-            return self._pipeline.ring_buffer.tail
-        if self._ring_buffer is not None and hasattr(self._ring_buffer, "tail"):
-            return self._ring_buffer.tail
+        rb = self._ring_buffer
+        if rb is None and self._pipeline is not None:
+            if not getattr(self._pipeline, "is_closed", False):
+                rb = getattr(self._pipeline, "ring_buffer", None)
+        if rb is not None and not getattr(rb, "is_closed", False):
+            try:
+                return rb.tail
+            except Exception:
+                pass
+        if self._pipeline is not None and hasattr(self._pipeline, "metrics"):
+            return self._pipeline.metrics.orders_processed
         return self._manual_orders_consumed
 
     def _resolve_orders_processed(self) -> int | None:
@@ -693,6 +731,8 @@ class DashboardMetricsCollector:
     def _resolve_trades_executed(self) -> int | None:
         if self._engine is not None and hasattr(self._engine, "total_trades"):
             return self.engine_total_trades
+        if self._pipeline is not None and hasattr(self._pipeline, "metrics"):
+            return self._pipeline.metrics.trades_executed
         if self._pipeline is not None and hasattr(self._pipeline, "total_trades"):
             return self._pipeline.total_trades
         return self._manual_trades_executed
@@ -700,6 +740,8 @@ class DashboardMetricsCollector:
     def _resolve_volume_executed(self) -> int | None:
         if self._engine is not None and hasattr(self._engine, "total_volume_traded"):
             return self._engine.total_volume_traded
+        if self._pipeline is not None and hasattr(self._pipeline, "metrics"):
+            return self._pipeline.metrics.volume_executed
         if self._pipeline is not None and hasattr(self._pipeline, "total_volume"):
             return self._pipeline.total_volume
         return self._manual_volume_executed
@@ -713,20 +755,25 @@ class DashboardMetricsCollector:
     def _resolve_ring_buffer_telemetry(
         self,
     ) -> tuple[int | None, int | None, float | None]:
-        rb = self._ring_buffer
-        if rb is None and self._pipeline is not None and hasattr(self._pipeline, "ring_buffer"):
-            rb = self._pipeline.ring_buffer
-
-        if rb is None:
+        if self._pipeline is not None and getattr(self._pipeline, "is_closed", False):
             return None, None, None
 
-        cap = getattr(rb, "capacity", None)
-        occ = getattr(rb, "occupied", None)
-        util = None
-        if cap is not None and cap > 0 and occ is not None:
-            util = max(0.0, min(1.0, float(occ) / float(cap)))
+        rb = self._ring_buffer
+        if rb is None and self._pipeline is not None:
+            rb = getattr(self._pipeline, "ring_buffer", None)
 
-        return cap, occ, util
+        if rb is None or getattr(rb, "is_closed", False):
+            return None, None, None
+
+        try:
+            cap = getattr(rb, "capacity", None)
+            occ = getattr(rb, "occupied", None)
+            util = None
+            if cap is not None and cap > 0 and occ is not None:
+                util = max(0.0, min(1.0, float(occ) / float(cap)))
+            return cap, occ, util
+        except Exception:
+            return None, None, None
 
     def _resolve_error_metrics(
         self,

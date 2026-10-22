@@ -117,7 +117,7 @@ ChronosMatch adopts a staged, test-driven engineering approach. Below is the exp
 | **Cython LOB & Matching Core** | Phase 4 | **Implemented** | L3 price-time priority order book, intrusive queue, Python baseline + compiled Cython extension. |
 | **Market Feed & Pipeline Integration** | Phase 5 | **Implemented** | Bursty Poisson market feed simulator, backpressure handling, end-to-end `TradingPipeline` integration. |
 | **Trade Persistence & Crash Recovery** | Phase 12 | **Implemented** | Append-only binary WAL (CRC32, LSN), `TradeStore`, `DurabilityPolicy`, deterministic replay and crash recovery. |
-| **Terminal Dashboard & Telemetry** | Phase 13 | *Planned* | Terminal UI (Rich/Textual), real-time L2 depth ladder, trade tape, tick-to-trade latency histogram. |
+| **Terminal Dashboard & Telemetry** | Phase 13 | **Implemented** | Non-blocking terminal UI, real-time BBO spread, order flow, ring buffer telemetry, and microsecond latency distribution (p50/p95/p99). |
 
 ---
 
@@ -220,15 +220,98 @@ rootdir: ...\Chronos-match
 configfile: pyproject.toml
 testpaths: tests
 plugins: anyio-4.12.1, asyncio-1.4.0
-collected 4 items
+collected 578 items
 
 tests\test_project_setup.py::test_package_import PASSED                   [ 25%]
 tests\test_project_setup.py::test_package_version PASSED                  [ 50%]
 tests\test_project_setup.py::test_package_exports PASSED                  [ 75%]
 tests\test_project_setup.py::test_package_docstring PASSED                [100%]
 
-============================== 4 passed in 0.06s ==============================
+============================ 578 passed in 16.37s =============================
 ```
+
+---
+
+### Launching the Real-Time Terminal Dashboard
+
+ChronosMatch includes an interactive, decoupled terminal dashboard providing real-time telemetry from the live trading pipeline or a standalone simulation.
+
+#### 1. Live Pipeline Execution (Default)
+Run a live end-to-end simulation through the market feed, shared-memory IPC, ring buffer, and matching engine:
+```bash
+python -m chronosmatch.dashboard --orders 5000 --rate 2000 --mode POISSON
+```
+
+#### 2. Standalone Demo Mode
+Run continuous synthetic market flow without pipeline allocation:
+```bash
+python -m chronosmatch.dashboard --demo --refresh 0.25
+```
+
+#### 3. Single-Snapshot Inspection
+Print an instantaneous snapshot of current telemetry and exit immediately:
+```bash
+python -m chronosmatch.dashboard --once
+```
+
+#### CLI Options & Flags
+| Flag | Short | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--orders` | `-n` | `5000` | Total orders to simulate and match through the pipeline. |
+| `--rate` | | `2000.0` | Target synthetic order generation rate in orders/second. |
+| `--mode` | | `POISSON` | Simulator traffic pattern (`POISSON`, `UNIFORM`, `BURST`, `MAX_THROUGHPUT`). |
+| `--capacity` | | `1024` | Ring buffer slot capacity (must be a power of two). |
+| `--refresh` | `-r` | `0.5` | UI refresh interval in seconds. |
+| `--wal` | | `None` | Optional path to Write-Ahead Log for persistent audit logging. |
+| `--cython` | | `False` | Use compiled Cython matching engine if available. |
+| `--demo` | | `False` | Run in standalone demo simulation mode. |
+| `--once` | | `False` | Render a single snapshot and exit immediately. |
+| `--plain` | | `False` | Disable cursor escape sequences and stream plain text frames. |
+| `--ascii` | | `False` | Use plain ASCII box borders (`+`, `-`, `\|`) instead of Unicode. |
+| `--no-color` | | `False` | Disable ANSI color codes. |
+
+#### Metrics Displayed & Definitions
+- **System Runtime & Throughput**:
+  - `Elapsed Runtime`: Monotonic clock runtime (`MM:SS.mmm`).
+  - `Wall Clock Time`: High-precision UTC timestamp.
+  - `Cum. Throughput`: Cumulative processed orders divided by total elapsed seconds (`ops/s`).
+  - `Win. Throughput`: Sliding-window throughput calculated between consecutive refresh frames (`ops/s`).
+- **Order Flow & Pipeline Status**:
+  - `Orders Generated`: Synthetic orders created by the market simulator.
+  - `Orders Published`: Orders written into the shared-memory ring buffer.
+  - `Orders Consumed`: Orders read from the ring buffer by the consumer.
+  - `Orders Processed`: Orders matched by the limit order book engine.
+  - `Orders Cancelled`: Resting orders cancelled from the book.
+  - `Orders Dropped`: Orders dropped due to buffer saturation/backpressure.
+- **Trade Executions & Market State**:
+  - `Executed Trades`: Total trade matches produced by the matching engine.
+  - `Traded Volume`: Cumulative share/contract volume executed.
+  - `Best Bid` / `Best Ask`: Current Top-of-Book prices in the order book.
+  - `BBO Spread`: Difference between Best Ask and Best Bid.
+  - `Book Depth Levels`: Combined count of active bid and ask price levels.
+- **Ring Buffer Telemetry**:
+  - `Buffer Capacity`: Total allocated 64-byte slots in the circular buffer.
+  - `Occupied Slots`: Monotonic difference between producer `head` and consumer `tail`.
+  - `Utilization`: Visual fill bar and percentage indicating ring buffer occupancy.
+- **Order-to-Trade Latency Distribution**:
+  - `p50 (Median)`, `p95`, `p99`, `p99.9`: Percentile matching latency in microseconds (`µs`).
+  - `Min Latency`, `Mean Latency`, `Max Latency`: Distribution summary statistics.
+  - `Sample Count`: Number of order execution duration samples recorded in bounded reservoir.
+- **System Diagnostics & Anomalies**:
+  - `Malformed Msgs`: Corrupted binary records detected and safely discarded.
+  - `Duplicate Orders`: Rejected orders with conflicting existing identifiers.
+  - `Processing Errors`: Aggregate processing and validation anomalies.
+  - `Backpressure Evt`: Occurrences of producer throttling due to buffer saturation.
+
+#### Configuration & Dependencies
+- **Core Engine**: Pure Python 3.12+ standard library (`threading`, `time`, `dataclasses`, `argparse`).
+- **Optional Console Enhancement**: `colorama` for Windows virtual terminal ANSI sequences (auto-detected).
+- **Core Engine Indicator**: The dashboard header explicitly displays `Core: Python` or `Core: Cython`. Acceleration is only reported when the compiled extension binary is loaded and used.
+
+#### Known Limitations & Unavailable Metrics
+- **Strict Metric Integrity**: Unavailable metrics are rendered as `N/A` rather than misleading zeros. For example, if no trades have crossed, `Best Bid` or `Spread` display `N/A`.
+- **Latency Instrumentation**: Microsecond latency distributions are tracked only when `instrument_latency=True` (default in pipeline runner); uninstrumented components report `N/A (No Samples)`.
+- **Single-Host Scoping**: Telemetry measures intra-process and shared-memory communication on a single host. Network transit time (e.g. NIC-to-socket) is outside simulation scope.
 
 ---
 

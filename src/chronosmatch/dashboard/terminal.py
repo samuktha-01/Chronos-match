@@ -481,10 +481,12 @@ class DashboardRenderer:
             tz=datetime.timezone.utc,
         ).strftime("%H:%M:%S UTC")
 
+        engine_core = "Cython" if snapshot.is_cython_accelerated else "Python"
         source_info = (
             f"  Source: {styler.bold(src_name):<14} "
+            f"Core: {engine_core} "
             f"Status: {status_str} "
-            f"Refresh: {interval_str} "
+            f"Int: {interval_str} "
             f"{utc_short}"
         )
         lines.append(self._pad_row(source_info))

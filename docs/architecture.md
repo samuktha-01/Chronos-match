@@ -172,17 +172,20 @@ flowchart TD
 - **Trade Persistence**:
   - `TradeStore`: Dedicated storage repository indexing trades by stable identifier and participating order IDs, providing historical queries and aggregated volume telemetry.
 
-### 3.7 Component 7: Terminal Dashboard
+### 3.7 Component 7: Terminal Dashboard & Telemetry Layer
 
-- **Primary Responsibility**: Provides real-time visual observability into engine operations, market depth, and performance metrics.
-- **Decoupled Telemetry**:
-  - The matching core updates a compact shared-memory telemetry block (or low-frequency metrics ring buffer) at fixed microsecond intervals.
-  - The dashboard runs as an independent console UI process/thread (using Rich/Textual/curses).
-- **Console Interface Elements**:
-  - **Level 2 (L2) Depth Ladder**: Top 10 Bids and Top 10 Asks, with visual depth bars and Best Bid/Offer (BBO) spread.
-  - **Real-Time Trade Tape**: Scrolling stream of recent executions (timestamp, price, quantity, aggressive side).
-  - **Throughput Telemetry**: Orders processed per second, peak burst throughput.
-  - **Latency Distribution**: Real-time display of $T_{\text{tick-to-trade}}$ percentiles (p50, p90, p99, p99.9).
+- **Primary Responsibility**: Provides real-time visual observability into engine operations, order book state, throughput, ring buffer utilization, and tick-to-trade latency distributions without impacting the critical matching path.
+- **Implemented Architecture & Telemetry Pipeline**:
+  - `DashboardMetricsCollector`: Thread-safe, non-blocking telemetry adapter polling attached `TradingPipeline`, `MatchingEngine`, `RingBuffer`, and `MarketSimulator` instances. Calculates cumulative throughput and incremental sliding-window throughput using high-precision monotonic nanosecond clocks.
+  - `LatencyInstrumentedEngine`: Transparent proxy intercepting `process_order()` with nanosecond timing (`time.perf_counter_ns()`), recording durations directly into a `BoundedLatencyTracker` reservoir without mutating underlying order book state.
+  - `BoundedLatencyTracker`: Fixed-capacity circular reservoir (default 10,000 samples) enforcing an upper memory bound while maintaining rolling microsecond percentiles (p50, p95, p99, p99.9, min, mean, max).
+  - `DashboardRenderer`: Pure-Python ANSI rendering engine formatting fixed-width (80-column) frames with Unicode or ASCII box borders, ANSI color alerts, and utilization bar indicators.
+  - `TerminalDashboard`: Manages background rendering thread lifecycle with configurable refresh interval (default 0.5s), immediate shutdown wakeups, and safe terminal cursor restoration.
+  - `PipelineDashboardRunner`: High-level orchestrator coordinating concurrent pipeline execution and decoupled terminal dashboard updates. Supports synchronous batch execution, asynchronous streaming, and deterministic single-step processing.
+- **Strict Metric Integrity**:
+  - Unavailable metrics are explicitly formatted as `N/A` rather than misleading zeros.
+  - Cython acceleration is verified via `is_cython_compiled() and isinstance(engine, CythonMatchingEngine)`; uncompiled environments display `Core: Python`.
+  - Closed ring buffers and missing optional components (WAL, TradeStore) are handled gracefully without exceptions.
 
 ---
 
@@ -370,7 +373,7 @@ The repository structure matches the architectural layers:
 | **Synthetic Market Simulator** | Async Poisson / burst feed | [src/chronosmatch/market_simulator.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/market_simulator.py) |
 | **End-to-End Trading Pipeline** | Integrated orchestration | [src/chronosmatch/pipeline.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/pipeline.py) |
 | **Trade-Event Persistence & WAL** | Append-only binary WAL, TradeStore, Crash Recovery | [src/chronosmatch/persistence.py](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/persistence.py) |
-| **Planned Dashboard UI** | Rich / Textual Terminal UI | `src/chronosmatch/dashboard/` *(Planned Next Phase)* |
+| **Terminal Dashboard & Telemetry** | Real-time terminal UI, metrics adapter, latency tracker | [src/chronosmatch/dashboard/](file:///c:/Users/keert/OneDrive/Desktop/Chronosmatch-project1/Chronos-match/src/chronosmatch/dashboard/) |
 
 ---
 
@@ -385,7 +388,7 @@ Phase 3: Lock-Free SPSC Ring Buffer              [COMPLETED]
 Phase 4: Limit Order Book & Matching Engine Core [COMPLETED]
 Phase 5: Market Simulator & Pipeline Integration [COMPLETED]
 Phase 6: WAL Persistence & Crash Recovery        [COMPLETED]
-Phase 7: Terminal Dashboard & Telemetry UI       [PLANNED]
+Phase 7: Terminal Dashboard & Telemetry UI       [COMPLETED]
 ```
 
 ### Phase Breakdown
@@ -398,7 +401,7 @@ Phase 7: Terminal Dashboard & Telemetry UI       [PLANNED]
 | **4** | **LOB & Matching Core** | L3 price-time priority order book, intrusive queue, Python baseline + optional Cython extension. | **COMPLETED** |
 | **5** | **Feed & Pipeline Integration**| Bursty Poisson market simulator, backpressure handling, end-to-end `TradingPipeline` integration. | **COMPLETED** |
 | **6** | **Trade WAL Persistence** | Off-path append-only WAL logging, deterministic replay harness, and crash recovery. | **COMPLETED** |
-| **7** | **Dashboard & Telemetry** | Real-time Rich/Textual terminal UI, nanosecond latency histogram, live depth book visualization. | *Planned* |
+| **7** | **Dashboard & Telemetry** | Real-time terminal dashboard, non-blocking telemetry adapter, latency percentiles. | **COMPLETED** |
 
 ---
 

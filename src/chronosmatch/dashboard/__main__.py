@@ -4,8 +4,11 @@ Allows launching the real-time terminal UI directly via:
     python -m chronosmatch.dashboard [options]
 
 Features:
+- Live ChronosMatch TradingPipeline execution (default).
+- Configurable order count (--orders) and throughput rate (--rate).
+- Multiple traffic simulation modes (--mode: POISSON, UNIFORM, BURST, MAX_THROUGHPUT).
 - Configurable refresh interval (--refresh / -r).
-- Demo simulation mode (--demo) generating live synthetic trades and latencies.
+- Demo simulation mode (--demo) generating synthetic manual orders.
 - Plain-text mode (--plain) for non-interactive log streaming.
 - Pure ASCII box mode (--ascii) for legacy consoles.
 - Single snapshot execution (--once).
@@ -15,16 +18,32 @@ Features:
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import random
 import sys
+import threading
 import time
+from typing import Any
 
+from chronosmatch.cython_engine import is_cython_compiled, CythonMatchingEngine
 from chronosmatch.dashboard.metrics import (
     BoundedLatencyTracker,
     DashboardMetricsCollector,
 )
+from chronosmatch.dashboard.pipeline_runner import (
+    PipelineDashboardRunner,
+)
 from chronosmatch.dashboard.terminal import (
     TerminalDashboard,
+)
+from chronosmatch.market_simulator import (
+    MarketFeedConfig,
+    SimulationMode,
+)
+from chronosmatch.matching_engine import MatchingEngine
+from chronosmatch.pipeline import (
+    TradingPipeline,
+    create_pipeline,
 )
 
 
@@ -39,11 +58,7 @@ def _run_demo_producer(
     cancelled = 0
     dropped = 0
 
-    best_bid = 100.00
-    best_ask = 100.05
-
     while not stop_event.is_set():
-        # Simulate burst of orders
         batch_size = random.randint(50, 200)
         orders += batch_size
         collector.record_order_generated(batch_size)
@@ -51,27 +66,22 @@ def _run_demo_producer(
         collector.record_order_consumed(batch_size)
         collector.record_order_processed(batch_size)
 
-        # Simulate trades and latencies
         if random.random() < 0.6:
             trade_qty = random.randint(10, 100)
             trades += 1
             volume += trade_qty
             collector.record_trade(trade_qty)
 
-            # Record realistic latency sample in nanoseconds (800ns to 15,000ns)
             simulated_latency_ns = random.gauss(1_500, 400)
             if random.random() < 0.02:
-                # Occasional tail latency spike
                 simulated_latency_ns = random.uniform(8_000, 35_000)
             collector.record_latency(max(400.0, simulated_latency_ns))
 
-        # Occasional cancel
         if random.random() < 0.15:
             canc = random.randint(1, 5)
             cancelled += canc
             collector.record_order_cancelled(canc)
 
-        # Rare drop
         if random.random() < 0.01:
             dropped += 1
             collector.record_order_dropped(1)
@@ -86,16 +96,52 @@ def main(argv: list[str] | None = None) -> int:
         description="ChronosMatch Real-Time Terminal Telemetry Dashboard",
     )
     parser.add_argument(
+        "--orders",
+        "-n",
+        type=int,
+        default=5_000,
+        help="Total orders to simulate and match through the pipeline (default: 5,000)",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=2_000.0,
+        help="Target synthetic order generation rate in ops/sec (default: 2,000)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["POISSON", "UNIFORM", "BURST", "MAX_THROUGHPUT"],
+        default="POISSON",
+        help="Market simulator traffic pattern mode (default: POISSON)",
+    )
+    parser.add_argument(
+        "--capacity",
+        type=int,
+        default=1024,
+        help="Ring buffer slot capacity (default: 1024)",
+    )
+    parser.add_argument(
         "--refresh",
         "-r",
         type=float,
         default=0.5,
-        help="Refresh interval in seconds (default: 0.5s)",
+        help="Dashboard refresh interval in seconds (default: 0.5s)",
     )
     parser.add_argument(
         "--demo",
         action="store_true",
-        help="Run in demo mode with synthetic order flow simulation",
+        help="Run in standalone demo mode without attached TradingPipeline",
+    )
+    parser.add_argument(
+        "--wal",
+        type=str,
+        default=None,
+        help="Optional path to Write-Ahead Log for persistent audit logging",
+    )
+    parser.add_argument(
+        "--cython",
+        action="store_true",
+        help="Use compiled Cython matching engine if available",
     )
     parser.add_argument(
         "--once",
@@ -124,52 +170,89 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("Error: --refresh interval must be strictly positive (> 0).\n")
         return 1
 
-    collector = DashboardMetricsCollector(
-        source_name="ChronosMatch Demo" if args.demo else "ChronosMatch Standalone"
-    )
+    # Single-shot execution
+    if args.once:
+        collector = DashboardMetricsCollector(source_name="ChronosMatch Snapshot")
+        dashboard = TerminalDashboard(
+            collector=collector,
+            interactive=False,
+            use_colors=not args.no_color,
+            use_unicode=False if args.ascii else None,
+        )
+        dashboard.render_once()
+        return 0
 
-    import threading
-
-    demo_stop_event = threading.Event()
-    demo_thread = None
-
+    # Demo simulation mode (standalone)
     if args.demo:
+        collector = DashboardMetricsCollector(source_name="ChronosMatch Demo")
         collector.start()
+        stop_event = threading.Event()
         demo_thread = threading.Thread(
             target=_run_demo_producer,
-            args=(collector, demo_stop_event),
+            args=(collector, stop_event),
             daemon=True,
         )
         demo_thread.start()
 
-    dashboard = TerminalDashboard(
-        collector=collector,
-        refresh_interval=args.refresh,
-        interactive=not args.plain and not args.once,
-        use_colors=not args.no_color,
-        use_unicode=False if args.ascii else None,
-        clear_screen=not args.plain and not args.once,
-    )
+        dashboard = TerminalDashboard(
+            collector=collector,
+            refresh_interval=args.refresh,
+            interactive=not args.plain,
+            use_colors=not args.no_color,
+            use_unicode=False if args.ascii else None,
+            clear_screen=not args.plain,
+        )
 
-    if args.once:
-        dashboard.render_once()
-        if demo_thread is not None:
-            demo_stop_event.set()
+        try:
+            dashboard.start()
+            while True:
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop_event.set()
+            dashboard.stop()
+            demo_thread.join(timeout=1.0)
+            sys.stdout.write("\nChronosMatch Demo Dashboard stopped gracefully.\n")
         return 0
 
+    # Real TradingPipeline execution
+    engine = None
+    if args.cython:
+        if is_cython_compiled():
+            engine = CythonMatchingEngine()
+        else:
+            sys.stderr.write("Note: Native Cython extension not compiled. Falling back to pure Python MatchingEngine.\n")
+            engine = MatchingEngine()
+
+    sim_mode = SimulationMode(args.mode)
+    config = MarketFeedConfig(
+        total_orders=args.orders,
+        rate=args.rate,
+        mode=sim_mode,
+    )
+    pipeline = create_pipeline(
+        config=config,
+        capacity=args.capacity,
+        engine=engine,
+        wal_path=args.wal,
+    )
+
+    runner = PipelineDashboardRunner(
+        pipeline=pipeline,
+        refresh_interval=args.refresh,
+        interactive=not args.plain,
+        use_colors=not args.no_color,
+        use_unicode=False if args.ascii else None,
+    )
+
     try:
-        dashboard.start()
-        # Keep main thread alive until interrupt
-        while True:
-            time.sleep(0.2)
+        runner.run(total_orders=args.orders)
     except KeyboardInterrupt:
-        pass
+        sys.stdout.write("\nChronosMatch Pipeline interrupted by user.\n")
     finally:
-        dashboard.stop()
-        if demo_thread is not None:
-            demo_stop_event.set()
-            demo_thread.join(timeout=1.0)
-        sys.stdout.write("\nChronosMatch Dashboard stopped gracefully.\n")
+        runner.close()
+        sys.stdout.write("\nChronosMatch Pipeline & Dashboard finished cleanly.\n")
 
     return 0
 
