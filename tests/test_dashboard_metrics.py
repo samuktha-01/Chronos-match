@@ -428,3 +428,126 @@ class TestConsistentMetricSnapshots:
         assert final_snap.orders_processed == 500
         assert final_snap.latency is not None
         assert final_snap.latency.sample_count == 500
+
+
+# ==============================================================================
+# 6. Controlled Throughput, Trade Accuracy & Unavailable Metric Behavior
+# ==============================================================================
+
+
+class TestMetricsCollectorValidationAndEdgeCases:
+    """Verify controlled throughput calculations, trade accuracy, and unavailable metric handling."""
+
+    def test_controlled_cumulative_throughput(self) -> None:
+        """Verify cumulative throughput with exact controlled inputs, sub-microsecond and zero intervals."""
+        collector = DashboardMetricsCollector()
+
+        # Normal interval
+        assert collector._compute_cumulative_throughput(100, 2.0) == 50.0
+        assert collector._compute_cumulative_throughput(1000, 0.25) == 4000.0
+
+        # Zero or negative interval returns 0.0 without division by zero
+        assert collector._compute_cumulative_throughput(100, 0.0) == 0.0
+        assert collector._compute_cumulative_throughput(100, -1.0) == 0.0
+
+        # Sub-microsecond interval (<= 1e-6) returns 0.0 safely
+        assert collector._compute_cumulative_throughput(100, 1e-7) == 0.0
+        assert collector._compute_cumulative_throughput(100, 1e-6) == 0.0
+
+        # None inputs
+        assert collector._compute_cumulative_throughput(None, 1.0) is None
+        assert collector._compute_cumulative_throughput(100, None) is None
+        assert collector._compute_cumulative_throughput(None, None) is None
+
+    def test_controlled_window_throughput(self) -> None:
+        """Verify sliding-window throughput using controlled order deltas and nanosecond intervals."""
+        collector = DashboardMetricsCollector()
+
+        # Uninitialized previous state returns None
+        assert collector._compute_window_throughput(100, 1_000_000_000) is None
+
+        # Seed previous state
+        collector._prev_processed_orders = 100
+        collector._prev_snapshot_time_ns = 1_000_000_000
+
+        # Advance by 0.5s (500_000_000 ns) with 40 new orders -> 80 ops/s
+        rate = collector._compute_window_throughput(140, 1_500_000_000)
+        assert rate == pytest.approx(80.0)
+
+        # Zero elapsed delta returns 0.0 safely
+        rate_zero_time = collector._compute_window_throughput(150, 1_000_000_000)
+        assert rate_zero_time == 0.0
+
+        # Sub-microsecond elapsed delta (<= 1e-6 seconds = 1000 ns) returns 0.0 safely
+        rate_micro = collector._compute_window_throughput(150, 1_000_000_500)
+        assert rate_micro == 0.0
+
+        # Negative order delta returns 0.0
+        rate_neg = collector._compute_window_throughput(90, 2_000_000_000)
+        assert rate_neg == 0.0
+
+    def test_trade_count_and_volume_accuracy_on_partial_fills(self) -> None:
+        """Verify executed trade count and traded volume accuracy when an incoming order partially fills multiple resting orders."""
+        engine = MatchingEngine()
+        collector = DashboardMetricsCollector(engine=engine)
+
+        # Post 2 resting SELL orders at different prices
+        # SELL 1: 10 @ 100.00
+        engine.process_order(Order(order_id="SELL-A", side=OrderSide.SELL, price=100.0, quantity=10, timestamp=1))
+        # SELL 2: 20 @ 102.00
+        engine.process_order(Order(order_id="SELL-B", side=OrderSide.SELL, price=102.0, quantity=20, timestamp=2))
+
+        # Check initial collector state: 0 trades, 0 volume
+        s0 = collector.take_snapshot()
+        assert s0.trades_executed == 0
+        assert s0.volume_executed == 0
+
+        # Incoming BUY: 25 @ 102.00 (Crosses SELL-A completely for 10 @ 100.00, and SELL-B partially for 15 @ 102.00)
+        trades = engine.process_order(Order(order_id="BUY-SWEEP", side=OrderSide.BUY, price=102.0, quantity=25, timestamp=3))
+
+        assert len(trades) == 2
+        assert trades[0].quantity == 10
+        assert trades[0].price == 100.0
+        assert trades[1].quantity == 15
+        assert trades[1].price == 102.0
+
+        # Engine level checks
+        assert engine.total_trades == 2
+        assert engine.total_volume_traded == 25
+
+        # Snapshot checks
+        s1 = collector.take_snapshot()
+        assert s1.trades_executed == 2
+        assert s1.volume_executed == 25
+        # Remaining resting ask: 5 @ 102.00
+        assert s1.best_ask == 102.0
+
+    def test_dashboard_formatters_when_metric_unavailable(self) -> None:
+        """Verify dashboard formatters return 'N/A' and never fabricate zeros when metrics are None."""
+        from chronosmatch.dashboard.terminal import (
+            AnsiStyler,
+            ASCII_BOX,
+            format_counter_with_alert,
+            format_int,
+            format_latency,
+            format_price,
+            format_rate,
+            format_time,
+            format_utilization_bar,
+            strip_ansi,
+        )
+
+        styler = AnsiStyler(enabled=False)
+
+        assert strip_ansi(format_int(None, styler)) == "N/A"
+        assert strip_ansi(format_rate(None, styler)) == "N/A"
+        assert strip_ansi(format_time(None, styler)) == "N/A"
+        assert strip_ansi(format_price(None, styler)) == "N/A"
+        assert strip_ansi(format_counter_with_alert(None, styler)) == "N/A"
+        assert strip_ansi(format_latency(None, styler)) == "N/A"
+        assert strip_ansi(format_utilization_bar(None, 10, ASCII_BOX, styler)) == "N/A"
+
+        # Explicit zero should NOT be 'N/A'
+        assert strip_ansi(format_int(0, styler)) == "0"
+        assert strip_ansi(format_rate(0.0, styler)) == "0.00 ops/s"
+        assert strip_ansi(format_counter_with_alert(0, styler)) == "0"

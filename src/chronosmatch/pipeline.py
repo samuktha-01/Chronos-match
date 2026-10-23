@@ -65,6 +65,7 @@ class TradingPipelineMetrics:
 
     orders_generated: int = 0
     orders_published: int = 0
+    orders_consumed: int = 0
     orders_processed: int = 0
     orders_cancelled: int = 0
     orders_dropped: int = 0
@@ -99,6 +100,7 @@ class TradingPipelineMetrics:
         return {
             "orders_generated": self.orders_generated,
             "orders_published": self.orders_published,
+            "orders_consumed": self.orders_consumed,
             "orders_processed": self.orders_processed,
             "orders_cancelled": self.orders_cancelled,
             "orders_dropped": self.orders_dropped,
@@ -117,6 +119,7 @@ class TradingPipelineMetrics:
         """Reset all metric counters to zero."""
         self.orders_generated = 0
         self.orders_published = 0
+        self.orders_consumed = 0
         self.orders_processed = 0
         self.orders_cancelled = 0
         self.orders_dropped = 0
@@ -233,10 +236,11 @@ class TradingPipeline:
             RingBufferClosedError: If ring buffer is closed.
         """
         self._check_closed()
-        self.metrics.orders_published += 1
         self._producer.publish_nowait(order)
+        self.metrics.orders_published += 1
 
         consumed_order = self._consumer.get_nowait()
+        self.metrics.orders_consumed += 1
         self.metrics.orders_processed += 1
 
         if self._wal is not None:
@@ -347,10 +351,13 @@ class TradingPipeline:
                 order = self._consumer.get_nowait()
             except (MalformedRecordError, SharedMemoryError, ValueError, TypeError):
                 # Malformed binary record detected in buffer slot
+                self.metrics.orders_consumed += 1
                 self.metrics.malformed_messages += 1
                 continue
             except RingBufferEmptyError:
                 break
+
+            self.metrics.orders_consumed += 1
 
             if self._wal is not None:
                 self._wal.append_order(order)
@@ -419,11 +426,14 @@ class TradingPipeline:
                     try:
                         order = self._consumer.get_nowait()
                     except (MalformedRecordError, SharedMemoryError, ValueError, TypeError):
+                        self.metrics.orders_consumed += 1
                         self.metrics.malformed_messages += 1
                         continue
                     except RingBufferEmptyError:
                         await asyncio.sleep(0.0005)
                         continue
+
+                    self.metrics.orders_consumed += 1
 
                     if self._wal is not None:
                         self._wal.append_order(order)
@@ -475,19 +485,33 @@ class TradingPipeline:
             backpressure_poll_interval=self.config.backpressure_poll_interval,
         )
         sim = MarketSimulator(sim_config)
+        self._simulator = sim
+
+        base_gen = self.metrics.orders_generated
+        base_pub = self.metrics.orders_published
+        base_drop = self.metrics.orders_dropped
+        base_bp = self.metrics.backpressure_events
+
+        def on_order(ord: Order) -> None:
+            self.metrics.orders_generated += 1
+
+        def on_publish(ord: Order) -> None:
+            self.metrics.orders_published += 1
 
         async def _producer_loop() -> None:
             try:
                 await sim.run(
                     producer=self._producer,
                     cancel_callback=on_cancel,
+                    order_callback=on_order,
+                    publish_callback=on_publish,
                 )
             finally:
-                # Synchronize simulator metrics back into pipeline metrics
-                self.metrics.orders_generated += sim.metrics.orders_generated
-                self.metrics.orders_published += sim.metrics.orders_published
-                self.metrics.orders_dropped += sim.metrics.orders_dropped
-                self.metrics.backpressure_events += sim.metrics.backpressure_events
+                # Synchronize final simulator metrics back into pipeline metrics
+                self.metrics.orders_generated = base_gen + sim.metrics.orders_generated
+                self.metrics.orders_published = base_pub + sim.metrics.orders_published
+                self.metrics.orders_dropped = base_drop + sim.metrics.orders_dropped
+                self.metrics.backpressure_events = base_bp + sim.metrics.backpressure_events
                 self._stop_event.set()
 
         try:

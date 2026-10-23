@@ -38,6 +38,7 @@ from chronosmatch.dashboard import (
 )
 from chronosmatch.dashboard.__main__ import main
 from chronosmatch.market_simulator import (
+    BackpressureMode,
     MarketFeedConfig,
     SimulationMode,
 )
@@ -552,3 +553,192 @@ class TestConvenienceRunnerAndCli:
         """Verify CLI main() rejects non-positive refresh intervals with exit code 1."""
         ret = main(["--refresh", "-1.0"])
         assert ret == 1
+
+
+# ==============================================================================
+# 7. Pipeline Metrics Validation, In-Flight Tracking & Final Reconciliation
+# ==============================================================================
+
+
+class TestPipelineMetricsValidationAndReconciliation:
+    """Verify generated-order counter increments, in-flight message tracking, drops, and reconciliation."""
+
+    def test_generated_order_counter_increments_and_final_reconciliation(self) -> None:
+        """Verify orders_generated is non-zero, increments properly, and reconciles with published/consumed/processed."""
+        out = io.StringIO()
+        total = 60
+        config = MarketFeedConfig(
+            total_orders=total,
+            rate=10000.0,
+            mode=SimulationMode.MAX_THROUGHPUT,
+            cancel_probability=0.0,
+        )
+        pipeline = create_pipeline(config=config, capacity=128)
+
+        runner = PipelineDashboardRunner(
+            pipeline=pipeline,
+            refresh_interval=0.05,
+            interactive=False,
+            use_colors=False,
+            use_unicode=False,
+            output=out,
+        )
+
+        try:
+            metrics = runner.run(total_orders=total)
+            assert metrics.orders_generated == total
+            assert metrics.orders_published == total
+            assert metrics.orders_consumed == total
+            assert metrics.orders_processed == total
+            assert metrics.orders_dropped == 0
+            assert metrics.duplicate_orders == 0
+            assert metrics.malformed_messages == 0
+
+            # Telemetry snapshot must strictly reflect non-zero generated orders
+            snapshot = runner.collector.take_snapshot()
+            assert snapshot.orders_generated == total
+            assert snapshot.orders_published == total
+            assert snapshot.orders_consumed == total
+            assert snapshot.orders_processed == total
+            assert snapshot.orders_dropped == 0
+            assert snapshot.processing_errors == 0
+            assert snapshot.ring_buffer_occupied == 0
+
+            # Rendered text must display the exact non-zero counts
+            rendered = out.getvalue()
+            assert_field(rendered, "Orders Generated", str(total))
+            assert_field(rendered, "Orders Published", str(total))
+            assert_field(rendered, "Orders Consumed", str(total))
+            assert_field(rendered, "Orders Processed", str(total))
+        finally:
+            runner.close()
+
+    def test_counter_behavior_while_messages_in_flight(self) -> None:
+        """Verify published and consumed counter differences strictly correspond to in-flight buffer occupancy."""
+        from chronosmatch.ring_buffer import RingBuffer
+        from chronosmatch.producer_consumer import OrderConsumer, OrderProducer
+
+        rb = RingBuffer.create_anonymous(capacity=16)
+        producer = OrderProducer(rb)
+        consumer = OrderConsumer(rb)
+
+        collector = DashboardMetricsCollector(ring_buffer=rb)
+
+        try:
+            # Step 1: Initial idle state (0 published, 0 consumed, 0 in flight)
+            s0 = collector.take_snapshot()
+            assert s0.orders_published == 0
+            assert s0.orders_consumed == 0
+            assert s0.ring_buffer_occupied == 0
+
+            # Step 2: Enqueue 5 orders without consuming -> 5 messages in flight
+            for i in range(5):
+                producer.publish(Order(order_id=f"INF-{i}", side=OrderSide.BUY, price=100.0 + i, quantity=1, timestamp=i + 1))
+
+            s1 = collector.take_snapshot()
+            assert s1.orders_published == 5
+            assert s1.orders_consumed == 0
+            assert s1.ring_buffer_occupied == 5
+            # Difference strictly equals in-flight messages
+            assert (s1.orders_published - s1.orders_consumed) == s1.ring_buffer_occupied == 5
+
+            # Step 3: Consume 2 orders -> 3 messages in flight
+            o1 = consumer.receive()
+            o2 = consumer.receive()
+            assert o1.order_id == "INF-0"
+            assert o2.order_id == "INF-1"
+
+            s2 = collector.take_snapshot()
+            assert s2.orders_published == 5
+            assert s2.orders_consumed == 2
+            assert s2.ring_buffer_occupied == 3
+            assert (s2.orders_published - s2.orders_consumed) == s2.ring_buffer_occupied == 3
+
+            # Step 4: Drain remaining 3 orders -> 0 in flight, perfect reconciliation
+            remaining = consumer.drain()
+            assert len(remaining) == 3
+
+            s3 = collector.take_snapshot()
+            assert s3.orders_published == 5
+            assert s3.orders_consumed == 5
+            assert s3.ring_buffer_occupied == 0
+            assert (s3.orders_published - s3.orders_consumed) == 0
+        finally:
+            producer.close()
+            consumer.close()
+            rb.close()
+
+    def test_orders_dropped_counter_under_saturation(self) -> None:
+        """Verify that when the downstream buffer saturates in DROP mode, orders_dropped is incremented."""
+        config = MarketFeedConfig(
+            total_orders=20,
+            rate=10000.0,
+            mode=SimulationMode.MAX_THROUGHPUT,
+            backpressure_mode=BackpressureMode.DROP,
+        )
+        # Create pipeline with minimal ring buffer capacity (4) without running consumer
+        pipeline = create_pipeline(config=config, capacity=4)
+        try:
+            # Fill the buffer to capacity
+            for i in range(4):
+                order = pipeline.simulator.next_order()
+                published = asyncio.run(pipeline.simulator.publish_order(order, pipeline.producer))
+                assert published is True
+
+            assert pipeline.producer.is_full is True
+            assert pipeline.simulator.metrics.orders_published == 4
+
+            # Attempt to publish 3 more orders -> must drop due to saturation
+            for _ in range(3):
+                order = pipeline.simulator.next_order()
+                published = asyncio.run(pipeline.simulator.publish_order(order, pipeline.producer))
+                assert published is False
+
+            assert pipeline.simulator.metrics.orders_dropped == 3
+            assert pipeline.simulator.metrics.orders_published == 4
+            assert pipeline.simulator.metrics.orders_generated == 7
+            assert pipeline.simulator.metrics.backpressure_events >= 3
+
+            # Verify collector reflects drops and backpressure
+            collector = DashboardMetricsCollector(simulator=pipeline.simulator, ring_buffer=pipeline.ring_buffer)
+            snap = collector.take_snapshot()
+            assert snap.orders_dropped == 3
+            assert snap.orders_published == 4
+            assert snap.orders_generated == 7
+            assert snap.backpressure_events >= 3
+        finally:
+            pipeline.close()
+
+    def test_cancellations_counted_separately_from_new_orders(self) -> None:
+        """Verify that order cancellations increment orders_cancelled without distorting orders_generated."""
+        pipeline = create_pipeline(capacity=32)
+        try:
+            # Post resting order
+            ord1 = Order(order_id="REST-001", side=OrderSide.BUY, price=100.0, quantity=10, timestamp=1)
+            pipeline.process_order(ord1)
+            assert pipeline.metrics.orders_published == 1
+            assert pipeline.metrics.orders_processed == 1
+            assert pipeline.metrics.orders_cancelled == 0
+
+            # Cancel resting order
+            pipeline.cancel_order("REST-001")
+            assert pipeline.metrics.orders_cancelled == 1
+
+            collector = DashboardMetricsCollector(pipeline=pipeline)
+            snap = collector.take_snapshot()
+            assert snap.orders_cancelled == 1
+            assert snap.orders_processed == 1
+        finally:
+            pipeline.close()
+
+    def test_dashboard_render_with_unavailable_metrics_displays_na(self) -> None:
+        """Verify complete dashboard frame renders 'N/A' cleanly when telemetry sources are unavailable."""
+        collector = DashboardMetricsCollector(source_name="EmptySource")
+        dashboard = TerminalDashboard(collector=collector, interactive=False, use_colors=False)
+        rendered = dashboard.render_to_string()
+
+        # Should display 'N/A' for unavailable metrics rather than fake zeros
+        assert "Orders Generated:  N/A" in rendered or "Orders Generated:       N/A" in rendered or "N/A" in rendered
+        assert "Cum. Throughput:   N/A" in rendered or "Cum. Throughput:        N/A" in rendered or "N/A" in rendered
+        assert "p50 (Median):      N/A" in rendered or "(No Samples)" in rendered
+

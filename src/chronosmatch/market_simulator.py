@@ -804,6 +804,8 @@ class MarketSimulator:
         *,
         target_engine: Any = None,
         cancel_callback: Callable[[str], Any] | None = None,
+        order_callback: Callable[[Order], Any] | None = None,
+        publish_callback: Callable[[Order], Any] | None = None,
     ) -> SimulatorMetrics:
         """Run the market simulation loop until total_orders reached or stopped.
 
@@ -812,6 +814,8 @@ class MarketSimulator:
             target_engine: Optional MatchingEngine / LimitOrderBook to match orders
                 and apply cancellations against.
             cancel_callback: Optional callable invoked with order_id on cancellation.
+            order_callback: Optional callable invoked with Order immediately upon generation.
+            publish_callback: Optional callable invoked with Order immediately upon successful publication.
 
         Returns:
             Populated SimulatorMetrics.
@@ -853,9 +857,19 @@ class MarketSimulator:
                 # Generate new order
                 order = self.next_order()
                 count += 1
+                if order_callback is not None:
+                    try:
+                        order_callback(order)
+                    except Exception:
+                        pass
 
                 if producer is not None:
-                    await self.publish_order(order, producer)
+                    published = await self.publish_order(order, producer)
+                    if published and publish_callback is not None:
+                        try:
+                            publish_callback(order)
+                        except Exception:
+                            pass
 
                 if target_engine is not None:
                     if hasattr(target_engine, "process_order"):

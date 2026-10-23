@@ -640,7 +640,7 @@ class DashboardMetricsCollector:
     ) -> float | None:
         if processed is None or elapsed is None:
             return None
-        if elapsed <= 0.0:
+        if elapsed <= 1e-6:
             return 0.0
         return float(processed) / elapsed
 
@@ -657,15 +657,18 @@ class DashboardMetricsCollector:
         delta_orders = current_processed - self._prev_processed_orders
         delta_seconds = (now_ns - self._prev_snapshot_time_ns) / 1_000_000_000.0
 
-        if delta_seconds <= 0.0 or delta_orders < 0:
+        if delta_seconds <= 1e-6 or delta_orders < 0:
             return 0.0
         return float(delta_orders) / delta_seconds
 
     def _resolve_orders_generated(self) -> int | None:
         if self._pipeline is not None and hasattr(self._pipeline, "metrics"):
             gen = self._pipeline.metrics.orders_generated
-            if gen == 0 and hasattr(self._pipeline, "simulator") and hasattr(self._pipeline.simulator, "metrics"):
-                sim_gen = getattr(self._pipeline.simulator.metrics, "orders_generated", 0)
+            if gen > 0:
+                return gen
+            sim = getattr(self._pipeline, "simulator", self._simulator)
+            if sim is not None and hasattr(sim, "metrics"):
+                sim_gen = getattr(sim.metrics, "orders_generated", 0)
                 if sim_gen > 0:
                     return sim_gen
             return gen
@@ -685,6 +688,11 @@ class DashboardMetricsCollector:
                         return rb.head
                     except Exception:
                         pass
+            sim = getattr(self._pipeline, "simulator", self._simulator)
+            if sim is not None and hasattr(sim, "metrics"):
+                sim_pub = getattr(sim.metrics, "orders_published", 0)
+                if sim_pub > 0:
+                    return sim_pub
             return pub
         if self._simulator is not None and hasattr(self._simulator, "metrics"):
             return self._simulator.metrics.orders_published
@@ -706,6 +714,9 @@ class DashboardMetricsCollector:
             except Exception:
                 pass
         if self._pipeline is not None and hasattr(self._pipeline, "metrics"):
+            con = getattr(self._pipeline.metrics, "orders_consumed", None)
+            if con is not None and con > 0:
+                return con
             return self._pipeline.metrics.orders_processed
         return self._manual_orders_consumed
 
@@ -716,14 +727,30 @@ class DashboardMetricsCollector:
 
     def _resolve_orders_cancelled(self) -> int | None:
         if self._pipeline is not None and hasattr(self._pipeline, "metrics"):
-            return self._pipeline.metrics.orders_cancelled
+            canc = self._pipeline.metrics.orders_cancelled
+            if canc > 0:
+                return canc
+            sim = getattr(self._pipeline, "simulator", self._simulator)
+            if sim is not None and hasattr(sim, "metrics"):
+                sim_canc = getattr(sim.metrics, "orders_cancelled", 0)
+                if sim_canc > 0:
+                    return sim_canc
+            return canc
         if self._simulator is not None and hasattr(self._simulator, "metrics"):
             return self._simulator.metrics.orders_cancelled
         return self._manual_orders_cancelled
 
     def _resolve_orders_dropped(self) -> int | None:
         if self._pipeline is not None and hasattr(self._pipeline, "metrics"):
-            return self._pipeline.metrics.orders_dropped
+            drop = self._pipeline.metrics.orders_dropped
+            if drop > 0:
+                return drop
+            sim = getattr(self._pipeline, "simulator", self._simulator)
+            if sim is not None and hasattr(sim, "metrics"):
+                sim_drop = getattr(sim.metrics, "orders_dropped", 0)
+                if sim_drop > 0:
+                    return sim_drop
+            return drop
         if self._simulator is not None and hasattr(self._simulator, "metrics"):
             return self._simulator.metrics.orders_dropped
         return self._manual_orders_dropped
@@ -783,6 +810,12 @@ class DashboardMetricsCollector:
             malformed = getattr(m, "malformed_messages", 0)
             duplicate = getattr(m, "duplicate_orders", 0)
             backpressure = getattr(m, "backpressure_events", 0)
+            if backpressure == 0:
+                sim = getattr(self._pipeline, "simulator", self._simulator)
+                if sim is not None and hasattr(sim, "metrics"):
+                    sim_bp = getattr(sim.metrics, "backpressure_events", 0)
+                    if sim_bp > 0:
+                        backpressure = sim_bp
             proc_errors = malformed + duplicate
             return malformed, duplicate, proc_errors, backpressure
 
@@ -822,8 +855,8 @@ class DashboardMetricsCollector:
         if book is not None:
             bids = getattr(book, "bids", None)
             asks = getattr(book, "asks", None)
-            b_levels = len(bids.depth()) if bids and hasattr(bids, "depth") else 0
-            a_levels = len(asks.depth()) if asks and hasattr(asks, "depth") else 0
+            b_levels = len(bids.price_levels) if bids and hasattr(bids, "price_levels") else (len(bids.depth()) if bids and hasattr(bids, "depth") else 0)
+            a_levels = len(asks.price_levels) if asks and hasattr(asks, "price_levels") else (len(asks.depth()) if asks and hasattr(asks, "depth") else 0)
             depth_levels = b_levels + a_levels
 
         return best_bid, best_ask, spread, depth_levels
