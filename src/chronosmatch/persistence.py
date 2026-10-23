@@ -823,7 +823,12 @@ class TradeStore:
             self._load_existing_trades()
 
     def _load_existing_trades(self) -> None:
-        """Read any previously persisted trades from the backing file."""
+        """Read any previously persisted trades from the backing file.
+
+        Safely recovers all fully-formed trade records and truncates any
+        trailing incomplete or corrupted records from prior crashes, aligning
+        the write pointer to the next valid record boundary.
+        """
         if self._file is None:
             return
         self._file.seek(0, os.SEEK_END)
@@ -841,6 +846,14 @@ class TradeStore:
                 self._index_trade(trade)
             except Exception:
                 break
+
+        valid_bytes = len(self._trades) * TRADE_PAYLOAD_SIZE
+        if size != valid_bytes:
+            self._file.seek(valid_bytes)
+            self._file.truncate(valid_bytes)
+            self._file.flush()
+        else:
+            self._file.seek(valid_bytes)
 
     def _index_trade(self, trade: Trade) -> None:
         """Index a trade in memory."""
@@ -970,6 +983,12 @@ class TradeStore:
                 if rec.is_trade and isinstance(rec.data, Trade):
                     store.append_trade(rec.data)
         return store
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
 
 # ==============================================================================

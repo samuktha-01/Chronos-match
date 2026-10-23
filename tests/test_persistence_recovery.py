@@ -39,6 +39,7 @@ from chronosmatch.persistence import (
     RecoveryError,
     RecoveryManager,
     RecoveryResult,
+    TRADE_PAYLOAD_SIZE,
     TradeStore,
     WALClosedError,
     WALCorruptedRecordError,
@@ -256,6 +257,58 @@ class TestTradePersistence:
         assert store.total_volume() == 30
         assert store.get_trade(1).price == 100
         assert store.get_trade(2).price == 105
+
+    def test_trade_store_reopen_with_truncated_trailing_record(self, tmp_path: Path) -> None:
+        """Verify TradeStore recovers valid trades and truncates trailing partial writes from crashes."""
+        trade_file = tmp_path / "corrupt_trailing.dat"
+        t1 = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100)
+        t2 = Trade(trade_id=2, resting_order_id="M2", incoming_order_id="T2", price=101.5, quantity=20, timestamp=200)
+        t3 = Trade(trade_id=3, resting_order_id="M3", incoming_order_id="T3", price=102.0, quantity=30, timestamp=300)
+
+        # 1. Write 2 trades cleanly and close
+        with TradeStore(filepath=trade_file) as store:
+            store.append_trades([t1, t2])
+        assert trade_file.stat().st_size == 2 * TRADE_PAYLOAD_SIZE
+
+        # 2. Simulate crash mid-write leaving 47 bytes of partial trailing data
+        with open(trade_file, "ab") as f:
+            f.write(b"X" * 47)
+        assert trade_file.stat().st_size == (2 * TRADE_PAYLOAD_SIZE) + 47
+
+        # 3. Reopen TradeStore: should safely recover t1 and t2, truncating trailing corrupt bytes
+        with TradeStore(filepath=trade_file) as store:
+            assert store.count() == 2
+            assert store.get_trade(1) == t1
+            assert store.get_trade(2) == t2
+            # Append new trade after recovery
+            store.append_trade(t3)
+
+        # 4. Verify file on disk is properly aligned to exactly 3 trade payloads (no misaligned offsets)
+        assert trade_file.stat().st_size == 3 * TRADE_PAYLOAD_SIZE
+
+        # 5. Reopen store in a new session and verify all 3 trades are cleanly readable
+        with TradeStore(filepath=trade_file) as store:
+            assert store.count() == 3
+            assert store.total_volume() == 60
+            assert store.get_trade(1) == t1
+            assert store.get_trade(2) == t2
+            assert store.get_trade(3) == t3
+
+    def test_trade_store_context_manager(self, tmp_path: Path) -> None:
+        """Verify TradeStore properly supports the context manager protocol."""
+        trade_file = tmp_path / "cm_test.dat"
+        t1 = Trade(trade_id=10, resting_order_id="M10", incoming_order_id="T10", price=50.0, quantity=5, timestamp=10)
+
+        with TradeStore(filepath=trade_file) as store:
+            assert not store.is_closed
+            store.append_trade(t1)
+
+        assert store.is_closed
+
+        # Reopen and confirm persisted
+        with TradeStore(filepath=trade_file) as store:
+            assert store.count() == 1
+            assert store.get_trade(10) == t1
 
 
 # ==============================================================================
