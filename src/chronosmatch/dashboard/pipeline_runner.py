@@ -138,7 +138,7 @@ class PipelineDashboardRunner:
         pipeline: TradingPipeline | None = None,
         *,
         refresh_interval: float = 0.5,
-        interactive: bool = True,
+        interactive: bool | None = None,
         use_colors: bool = True,
         use_unicode: bool | None = None,
         width: int = 80,
@@ -151,7 +151,7 @@ class PipelineDashboardRunner:
         Args:
             pipeline: Optional TradingPipeline instance (creates default if None).
             refresh_interval: Refresh interval in seconds for terminal rendering.
-            interactive: If True, writes cursor control escape codes; if False, streams plain frames.
+            interactive: If True, writes cursor control escape codes; if False, streams plain frames; if None, auto-detects.
             use_colors: If True, uses ANSI color escape sequences.
             use_unicode: If True, uses Unicode box drawing; if None, auto-detects from stream.
             width: Column width of dashboard box.
@@ -337,7 +337,7 @@ def run_pipeline_with_dashboard(
     mode: SimulationMode | None = None,
     capacity: int = 1024,
     refresh_interval: float = 0.5,
-    interactive: bool = True,
+    interactive: bool | None = None,
     use_colors: bool = True,
     use_unicode: bool | None = None,
     output: TextIO | None = None,
@@ -351,7 +351,7 @@ def run_pipeline_with_dashboard(
         mode: SimulationMode for arrival intervals (POISSON, UNIFORM, BURST, MAX_THROUGHPUT).
         capacity: RingBuffer slot capacity if creating a new pipeline.
         refresh_interval: Seconds between live dashboard refreshes.
-        interactive: If True, uses cursor home codes; if False, prints streaming text.
+        interactive: If True, uses cursor home codes; if False, prints streaming text; if None, auto-detects.
         use_colors: If True, applies ANSI color sequences.
         use_unicode: If True, uses Unicode borders; if None, auto-detects from stream.
         output: Destination stream (defaults to sys.stdout).

@@ -660,3 +660,156 @@ class TestFormattersAndUtilities:
         assert disabled.cyan("hello") == "hello"
         assert strip_ansi(enabled.bold("test")) == "test"
         assert visible_len(enabled.green("text")) == 4
+
+
+# ==============================================================================
+# 7. In-Place Rendering & Non-Interactive Regression Tests
+# ==============================================================================
+
+
+class TestInPlaceRenderingAndNonInteractiveOutput:
+    """Regression tests verifying single display in-place updating and non-interactive output safety."""
+
+    def test_interactive_repeated_renders_update_in_place_with_clear(self) -> None:
+        """Verify repeated renders in clear_screen mode use \033[H\033[J to cleanly overwrite display in place."""
+        collector = DashboardMetricsCollector()
+        stream = io.StringIO()
+        dashboard = TerminalDashboard(
+            collector=collector,
+            interactive=True,
+            clear_screen=True,
+            use_colors=False,
+            output=stream,
+        )
+
+        snap1 = collector.take_snapshot()
+        dashboard.render_snapshot(snap1, clear=True)
+        out1 = stream.getvalue()
+        # First frame clears screen and homes cursor
+        assert out1.startswith("\033[2J\033[H")
+        assert dashboard.render_count == 1
+
+        # Second frame MUST use \033[H\033[J to home cursor AND clear entire display
+        stream.seek(0)
+        stream.truncate(0)
+        snap2 = collector.take_snapshot()
+        dashboard.render_snapshot(snap2, clear=True)
+        out2 = stream.getvalue()
+        assert out2.startswith("\033[H\033[J")
+        assert dashboard.render_count == 2
+
+        # Third frame continues updating in place using \033[H\033[J
+        stream.seek(0)
+        stream.truncate(0)
+        snap3 = collector.take_snapshot()
+        dashboard.render_snapshot(snap3, clear=True)
+        out3 = stream.getvalue()
+        assert out3.startswith("\033[H\033[J")
+        assert dashboard.render_count == 3
+
+    def test_interactive_inline_repeated_renders_rewind_cursor(self) -> None:
+        """Verify repeated renders in inline mode (clear_screen=False) rewind cursor up by exact line count."""
+        collector = DashboardMetricsCollector()
+        stream = io.StringIO()
+        dashboard = TerminalDashboard(
+            collector=collector,
+            interactive=True,
+            clear_screen=False,
+            use_colors=False,
+            output=stream,
+        )
+
+        snap1 = collector.take_snapshot()
+        dashboard.render_snapshot(snap1, clear=False)
+        out1 = stream.getvalue()
+        # First frame starts without prefix
+        assert not out1.startswith("\033[")
+        lines_count = len(out1.splitlines())
+        assert lines_count == 33
+
+        # Second frame MUST rewind cursor up by 33 lines and clear down (\r\033[33A\033[J)
+        stream.seek(0)
+        stream.truncate(0)
+        snap2 = collector.take_snapshot()
+        dashboard.render_snapshot(snap2, clear=False)
+        out2 = stream.getvalue()
+        expected_rewind = f"\r\033[{lines_count}A\033[J"
+        assert out2.startswith(expected_rewind)
+        assert dashboard.render_count == 2
+
+    def test_non_interactive_background_loop_does_not_flood_output(self) -> None:
+        """Verify non-interactive background refresh thread does not repeatedly dump full screens to output."""
+        collector = DashboardMetricsCollector()
+        stream = io.StringIO()
+        dashboard = TerminalDashboard(
+            collector=collector,
+            refresh_interval=0.02,
+            interactive=False,
+            use_colors=False,
+            output=stream,
+        )
+
+        try:
+            dashboard.start()
+            # Wait for at least 4 refresh cycles
+            time.sleep(0.12)
+        finally:
+            dashboard.stop()
+
+        # Render count must have incremented in background
+        assert dashboard.render_count >= 3
+        # Output stream MUST NOT have been flooded with repeated 33-line full boxes during background loop
+        assert stream.getvalue() == ""
+
+        # Explicit render_once() must still cleanly write the complete final dashboard snapshot
+        dashboard.render_once()
+        final_out = stream.getvalue()
+        assert len(final_out) > 0
+        assert "CHRONOSMATCH" in final_out
+        # Exactly one box should be in final_out
+        assert final_out.count("CHRONOSMATCH") == 1
+
+    def test_auto_detect_interactive_mode_from_stream(self) -> None:
+        """Verify interactive property auto-detects TTY vs non-TTY stream when interactive=None."""
+        collector = DashboardMetricsCollector()
+
+        # Mock interactive TTY stream
+        mock_tty = MagicMock()
+        mock_tty.isatty.return_value = True
+        dash_tty = TerminalDashboard(collector=collector, output=mock_tty)
+        assert dash_tty.interactive is True
+
+        # Mock non-interactive pipe stream
+        mock_pipe = MagicMock()
+        mock_pipe.isatty.return_value = False
+        dash_pipe = TerminalDashboard(collector=collector, output=mock_pipe)
+        assert dash_pipe.interactive is False
+
+        # Explicit override takes precedence
+        dash_forced_int = TerminalDashboard(collector=collector, output=mock_pipe, interactive=True)
+        assert dash_forced_int.interactive is True
+
+        dash_forced_non_int = TerminalDashboard(collector=collector, output=mock_tty, interactive=False)
+        assert dash_forced_non_int.interactive is False
+
+    def test_cursor_hidden_and_restored_cleanly(self) -> None:
+        """Verify cursor hide (\033[?25l) and restore (\033[?25h\033[0m) codes in interactive mode."""
+        collector = DashboardMetricsCollector()
+        stream = io.StringIO()
+        dashboard = TerminalDashboard(
+            collector=collector,
+            interactive=True,
+            use_colors=True,
+            output=stream,
+        )
+
+        dashboard.start()
+        started_out = stream.getvalue()
+        assert "\033[?25l" in started_out  # Cursor hidden
+
+        stream.seek(0)
+        stream.truncate(0)
+        dashboard.stop()
+        stopped_out = stream.getvalue()
+        assert "\033[?25h\033[0m" in stopped_out  # Cursor restored and style reset
+

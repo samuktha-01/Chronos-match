@@ -13,6 +13,7 @@ Key Components:
 
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
 import datetime
 from decimal import Decimal
@@ -719,13 +720,60 @@ class DashboardRenderer:
 def can_encode_unicode(stream: Any) -> bool:
     """Check if the given stream encoding supports Unicode box-drawing characters."""
     encoding = getattr(stream, "encoding", None)
-    if not encoding:
-        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    if not isinstance(encoding, str):
+        encoding = getattr(sys.stdout, "encoding", None)
+        if not isinstance(encoding, str):
+            encoding = "utf-8"
     try:
         "┌─┐█░µs".encode(encoding)
         return True
-    except (UnicodeEncodeError, LookupError):
+    except (UnicodeEncodeError, LookupError, TypeError):
         return False
+
+
+def is_interactive_stream(stream: Any) -> bool:
+    """Determine whether a stream is connected to an interactive terminal."""
+    try:
+        return bool(hasattr(stream, "isatty") and stream.isatty())
+    except Exception:
+        return False
+
+
+def enable_windows_virtual_terminal() -> bool:
+    """Enable Windows Console virtual terminal processing for ANSI cursor and color codes."""
+    if os.name != "nt":
+        return True
+    success = False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        if handle not in (0, -1):
+            mode = ctypes.c_ulong()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+                if not (mode.value & 0x0004):
+                    kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+                success = True
+    except Exception:
+        pass
+
+    try:
+        import colorama  # type: ignore[import-untyped]
+
+        colorama.just_fix_windows_console()
+        success = True
+    except Exception:
+        pass
+
+    try:
+        os.system("")
+        success = True
+    except Exception:
+        pass
+
+    return success
 
 
 # ==============================================================================
@@ -749,7 +797,7 @@ class TerminalDashboard:
         collector: DashboardMetricsCollector,
         *,
         refresh_interval: float = 0.5,
-        interactive: bool = True,
+        interactive: bool | None = None,
         use_colors: bool = True,
         use_unicode: bool | None = None,
         width: int = 80,
@@ -763,6 +811,7 @@ class TerminalDashboard:
             collector: `DashboardMetricsCollector` instance providing telemetry snapshots.
             refresh_interval: Seconds between live UI re-renders (must be strictly > 0).
             interactive: If True, writes terminal cursor-control codes. If False, operates in plain streaming mode.
+                If None, automatically detects from output stream `isatty()`.
             use_colors: If True, outputs ANSI color escape codes. If False, plain text only.
             use_unicode: If True, uses Unicode box drawing and symbols. If False, ASCII only. If None, auto-detects from stream encoding.
             width: Total terminal column width.
@@ -778,9 +827,14 @@ class TerminalDashboard:
 
         self._collector = collector
         self._refresh_interval = refresh_interval
-        self._interactive = interactive
-        self._use_colors = use_colors
         self._output: TextIO = output if output is not None else sys.stdout
+
+        if interactive is None:
+            self._interactive = is_interactive_stream(self._output)
+        else:
+            self._interactive = bool(interactive)
+
+        self._use_colors = use_colors
 
         if use_unicode is None:
             self._use_unicode = can_encode_unicode(self._output)
@@ -802,6 +856,11 @@ class TerminalDashboard:
         self._lock = threading.Lock()
         self._last_snapshot: DashboardMetricsSnapshot | None = None
         self._render_count: int = 0
+        self._last_rendered_lines: int = 0
+        self._atexit_registered: bool = False
+
+        if os.name == "nt" and self._interactive:
+            enable_windows_virtual_terminal()
 
     # --------------------------------------------------------------------------
     # Lifecycle Controls
@@ -817,17 +876,17 @@ class TerminalDashboard:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("TerminalDashboard is already running.")
 
-            # Enable Windows virtual terminal ANSI processing if colorama is available
-            if os.name == "nt" and self._use_colors:
-                try:
-                    import colorama  # type: ignore[import-untyped]
+            if os.name == "nt" and self._interactive:
+                enable_windows_virtual_terminal()
 
-                    colorama.just_fix_windows_console()
-                except Exception:
-                    pass
-
-            if self._interactive and self._use_colors:
+            if self._interactive:
                 self._hide_cursor()
+                if not self._atexit_registered:
+                    try:
+                        atexit.register(self._restore_terminal)
+                        self._atexit_registered = True
+                    except Exception:
+                        pass
 
             self._stop_event.clear()
             self._thread = threading.Thread(
@@ -853,6 +912,13 @@ class TerminalDashboard:
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
 
+        if self._atexit_registered:
+            try:
+                atexit.unregister(self._restore_terminal)
+                self._atexit_registered = False
+            except Exception:
+                pass
+
         self._restore_terminal()
 
     def join(self, timeout: float | None = None) -> None:
@@ -865,6 +931,11 @@ class TerminalDashboard:
     def is_running(self) -> bool:
         """Return True if background rendering thread is currently active."""
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def interactive(self) -> bool:
+        """Return True if dashboard operates with interactive terminal cursor controls."""
+        return self._interactive
 
     @property
     def render_count(self) -> int:
@@ -923,7 +994,7 @@ class TerminalDashboard:
 
         Args:
             snapshot: Snapshot to render.
-            clear: If True in interactive mode, prefix output with cursor home code.
+            clear: If True in interactive mode, homes/clears terminal before overwriting.
 
         Returns:
             Rendered string.
@@ -938,8 +1009,13 @@ class TerminalDashboard:
             self._render_count += 1
 
             prefix = ""
-            if self._interactive and clear:
-                prefix = "\033[H" if self._render_count > 1 else "\033[2J\033[H"
+            if self._interactive:
+                if clear:
+                    # In interactive clear mode, home cursor and clear entire display to prevent leftover lines
+                    prefix = "\033[H\033[J" if self._render_count > 1 else "\033[2J\033[H"
+                elif self._render_count > 1 and self._last_rendered_lines > 0:
+                    # In inline mode without full screen clear, rewind cursor to the beginning of the previous dashboard
+                    prefix = f"\r\033[{self._last_rendered_lines}A\033[J"
 
             try:
                 self._output.write(f"{prefix}{rendered}\n")
@@ -956,6 +1032,8 @@ class TerminalDashboard:
                     refresh_interval=self._refresh_interval,
                 )
                 self._output.write(f"{prefix}{rendered}\n")
+
+            self._last_rendered_lines = len(rendered.splitlines())
 
             try:
                 self._output.flush()
@@ -1000,7 +1078,20 @@ class TerminalDashboard:
         try:
             while not self._stop_event.is_set():
                 snapshot = self._collector.take_snapshot()
-                self.render_snapshot(snapshot, clear=self._interactive and self._clear_screen)
+                if self._interactive:
+                    self.render_snapshot(snapshot, clear=self._clear_screen)
+                else:
+                    # In non-interactive mode, avoid flooding output with repeated full screens.
+                    # Maintain snapshot metrics, render count, and invoke on_render callbacks.
+                    with self._lock:
+                        self._last_snapshot = snapshot
+                        self._render_count += 1
+                    if self._on_render is not None:
+                        rendered = self._renderer.render(snapshot, refresh_interval=self._refresh_interval)
+                        try:
+                            self._on_render(snapshot, rendered)
+                        except Exception:
+                            pass
 
                 # Responsive wait: exits immediately when stop_event is signaled
                 if self._stop_event.wait(timeout=self._refresh_interval):

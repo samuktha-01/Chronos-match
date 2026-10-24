@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         dashboard = TerminalDashboard(
             collector=collector,
             refresh_interval=args.refresh,
-            interactive=not args.plain,
+            interactive=False if args.plain else None,
             use_colors=not args.no_color,
             use_unicode=False if args.ascii else None,
             clear_screen=not args.plain,
@@ -241,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     runner = PipelineDashboardRunner(
         pipeline=pipeline,
         refresh_interval=args.refresh,
-        interactive=not args.plain,
+        interactive=False if args.plain else None,
         use_colors=not args.no_color,
         use_unicode=False if args.ascii else None,
     )
