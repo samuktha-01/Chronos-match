@@ -37,6 +37,7 @@ from chronosmatch.binary_protocol import (
     _reconstruct_price,
     _validate_and_encode_order_id,
     _validate_and_scale_price,
+    _validate_quantity,
     decode_order,
     encode_order,
 )
@@ -276,13 +277,14 @@ def encode_trade_payload(trade: Trade) -> bytes:
     raw_trade_id = _validate_and_encode_order_id(trade_id_str)
 
     price_ticks, price_type = _validate_and_scale_price(trade.price)
+    qty = _validate_quantity(trade.quantity)
 
     return _TRADE_STRUCT.pack(
         raw_trade_id,
         raw_maker,
         raw_taker,
         price_ticks,
-        trade.quantity,
+        qty,
         price_type,
         is_int,
         trade.timestamp,
@@ -308,7 +310,14 @@ def decode_trade_payload(payload: bytes) -> Trade:
     ) = _TRADE_STRUCT.unpack(payload)
 
     trade_id_str = _decode_order_id(raw_trade_id)
-    trade_id: int | str = int(trade_id_str) if is_int == 1 else trade_id_str
+    if is_int == 1:
+        try:
+            trade_id: int | str = int(trade_id_str)
+        except ValueError as e:
+            raise ValueError(f"Corrupted integer trade_id in payload: {trade_id_str!r}") from e
+    else:
+        trade_id = trade_id_str
+
     maker_id = _decode_order_id(raw_maker)
     taker_id = _decode_order_id(raw_taker)
     price = _reconstruct_price(price_ticks, price_type)
@@ -499,12 +508,18 @@ class WriteAheadLog:
                 checksum,
             )
 
+            orig_pos = self._file.tell()
             try:
                 self._file.write(frame_header)
                 self._file.write(payload)
                 if self._auto_flush and self._durability != DurabilityPolicy.ASYNC_BUFFERED:
                     self._flush_file()
             except OSError as e:
+                try:
+                    self._file.seek(orig_pos)
+                    self._file.truncate(orig_pos)
+                except OSError:
+                    pass
                 raise WALWriteError(f"Failed to write record {lsn} to WAL: {e}") from e
 
             self._next_lsn += 1
@@ -870,6 +885,7 @@ class TradeStore:
             trade: The executed Trade instance.
 
         Raises:
+            PersistenceError: If the store is closed or a storage write failure occurs.
             DuplicateTradeError: If a trade with identical trade_id but conflicting fields exists.
         """
         if self._is_closed:
@@ -883,6 +899,7 @@ class TradeStore:
                     or existing.quantity != trade.quantity
                     or existing.resting_order_id != trade.resting_order_id
                     or existing.incoming_order_id != trade.incoming_order_id
+                    or existing.timestamp != trade.timestamp
                 ):
                     raise DuplicateTradeError(
                         f"Trade ID '{trade.trade_id}' already exists with conflicting data: "
@@ -891,20 +908,31 @@ class TradeStore:
                 # Idempotent re-submission: ignore without duplicating
                 return
 
-            self._index_trade(trade)
-
             if self._file is not None:
                 payload = encode_trade_payload(trade)
+                orig_pos = self._file.tell()
                 try:
                     self._file.write(payload)
                     self._file.flush()
                     if self._durability == DurabilityPolicy.IMMEDIATE_SYNC:
                         os.fsync(self._file.fileno())
                 except OSError as e:
+                    try:
+                        self._file.seek(orig_pos)
+                        self._file.truncate(orig_pos)
+                    except OSError:
+                        pass
                     raise PersistenceError(f"Failed to append trade to disk: {e}") from e
+
+            # Commit to in-memory state only after disk write succeeds
+            self._index_trade(trade)
 
     def append_trades(self, trades: list[Trade]) -> None:
         """Persist a list of executed trades in order."""
+        if not trades:
+            return
+        if self._is_closed:
+            raise PersistenceError("TradeStore is closed.")
         with self._lock:
             for trade in trades:
                 self.append_trade(trade)
@@ -937,18 +965,28 @@ class TradeStore:
     def flush(self) -> None:
         """Flush backing file to OS buffer."""
         with self._lock:
-            if self._file is not None and not self._is_closed:
-                self._file.flush()
+            if self._is_closed:
+                raise PersistenceError("TradeStore is closed.")
+            if self._file is not None:
+                try:
+                    self._file.flush()
+                except OSError as e:
+                    raise PersistenceError(f"Failed to flush trade store: {e}") from e
 
     def sync(self) -> None:
         """Synchronously commit backing file to disk."""
         with self._lock:
-            if self._file is not None and not self._is_closed:
-                self._file.flush()
-                os.fsync(self._file.fileno())
+            if self._is_closed:
+                raise PersistenceError("TradeStore is closed.")
+            if self._file is not None:
+                try:
+                    self._file.flush()
+                    os.fsync(self._file.fileno())
+                except OSError as e:
+                    raise PersistenceError(f"Failed to sync trade store to disk: {e}") from e
 
     def close(self) -> None:
-        """Close the trade store."""
+        """Flush, sync if needed, and safely close the trade store."""
         with self._lock:
             if self._is_closed:
                 return
@@ -956,12 +994,15 @@ class TradeStore:
             if self._file is not None:
                 try:
                     self._file.flush()
+                    if self._durability == DurabilityPolicy.IMMEDIATE_SYNC:
+                        os.fsync(self._file.fileno())
                 except Exception:
                     pass
-                try:
-                    self._file.close()
-                except Exception:
-                    pass
+                finally:
+                    try:
+                        self._file.close()
+                    except Exception:
+                        pass
 
     @property
     def filepath(self) -> Path | None:
@@ -974,9 +1015,14 @@ class TradeStore:
         return self._is_closed
 
     @classmethod
-    def from_wal(cls, wal_path: str | Path) -> TradeStore:
+    def from_wal(
+        cls,
+        wal_path: str | Path,
+        filepath: str | Path | None = None,
+        durability: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
+    ) -> TradeStore:
         """Construct a populated TradeStore by extracting all Trade records from a WAL file."""
-        store = cls()
+        store = cls(filepath=filepath, durability=durability)
         with WriteAheadLog(wal_path, create=False) as wal:
             records, _, _ = wal.read_records(strict=False)
             for rec in records:
@@ -1019,6 +1065,8 @@ class AsyncPersistenceWorker:
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=65536)
         self._stop_event = threading.Event()
         self._is_closed = False
+        self._last_error: BaseException | None = None
+        self._error_lock = threading.Lock()
         self._worker_thread = threading.Thread(
             target=self._run_loop,
             name="ChronosMatch-PersistenceWorker",
@@ -1026,20 +1074,33 @@ class AsyncPersistenceWorker:
         )
         self._worker_thread.start()
 
+    def _check_healthy(self) -> None:
+        if self._is_closed:
+            raise PersistenceError("AsyncPersistenceWorker is closed.")
+        with self._error_lock:
+            if self._last_error is not None:
+                raise PersistenceError(
+                    f"Async persistence worker background failure: {self._last_error}"
+                ) from self._last_error
+
     def submit_order(self, order: Order) -> None:
         """Submit an order event for asynchronous logging."""
+        self._check_healthy()
         self._queue.put(("ORDER", order))
 
     def submit_cancel(self, order_id: str, timestamp_ns: int | None = None) -> None:
         """Submit an order cancellation event for asynchronous logging."""
+        self._check_healthy()
         self._queue.put(("CANCEL", order_id, timestamp_ns))
 
     def submit_trade(self, trade: Trade) -> None:
         """Submit an executed trade for asynchronous logging."""
+        self._check_healthy()
         self._queue.put(("TRADE", trade))
 
     def submit_trades(self, trades: list[Trade]) -> None:
         """Submit a batch of executed trades for asynchronous logging."""
+        self._check_healthy()
         for trade in trades:
             self._queue.put(("TRADE", trade))
 
@@ -1061,42 +1122,58 @@ class AsyncPersistenceWorker:
                 pass
 
             if batch:
-                for item in batch:
-                    action = item[0]
-                    if action == "ORDER":
-                        self._wal.append_order(item[1])
-                    elif action == "CANCEL":
-                        self._wal.append_cancel(item[1], item[2])
-                    elif action == "TRADE":
-                        trade = item[1]
-                        self._wal.append_trade(trade)
-                        if self._trade_store is not None:
-                            self._trade_store.append_trade(trade)
-                    self._queue.task_done()
+                try:
+                    for item in batch:
+                        action = item[0]
+                        if action == "ORDER":
+                            self._wal.append_order(item[1])
+                        elif action == "CANCEL":
+                            self._wal.append_cancel(item[1], item[2])
+                        elif action == "TRADE":
+                            trade = item[1]
+                            self._wal.append_trade(trade)
+                            if self._trade_store is not None:
+                                self._trade_store.append_trade(trade)
 
-                self._wal.flush()
-                if self._trade_store is not None:
-                    self._trade_store.flush()
+                    self._wal.flush()
+                    if self._trade_store is not None:
+                        self._trade_store.flush()
+                except BaseException as e:
+                    with self._error_lock:
+                        if self._last_error is None:
+                            self._last_error = e
+                finally:
+                    # Always mark all tasks done to prevent flush() / join() deadlocks
+                    for _ in batch:
+                        self._queue.task_done()
 
     def flush(self) -> None:
         """Wait until all pending items in the queue have been written and flushed to disk."""
         self._queue.join()
+        with self._error_lock:
+            if self._last_error is not None:
+                raise PersistenceError(
+                    f"Async persistence worker background failure: {self._last_error}"
+                ) from self._last_error
         self._wal.flush()
         if self._trade_store is not None:
             self._trade_store.flush()
 
     def stop(self) -> None:
         """Signal worker thread to stop and wait for it to join."""
-        if self._is_closed:
-            return
         self._is_closed = True
         self._stop_event.set()
         self._worker_thread.join(timeout=5.0)
 
     def close(self) -> None:
         """Stop worker and flush remaining records."""
-        self.stop()
-        self.flush()
+        if self._is_closed:
+            return
+        self._is_closed = True
+        try:
+            self.flush()
+        finally:
+            self.stop()
 
 
 # ==============================================================================
@@ -1319,12 +1396,17 @@ class PersistedMatchingEngine:
             raise ValueError("Either 'wal' or 'wal_path' must be provided to PersistedMatchingEngine.")
 
         self._trade_store = trade_store
+        self._is_closed = False
         self._async_worker: AsyncPersistenceWorker | None = None
         if self._durability == DurabilityPolicy.ASYNC_BUFFERED:
             self._async_worker = AsyncPersistenceWorker(
                 wal=self._wal,
                 trade_store=self._trade_store,
             )
+
+    def _check_open(self) -> None:
+        if self._is_closed:
+            raise PersistenceError("PersistedMatchingEngine is closed.")
 
     def process_order(self, order: Order) -> list[Trade]:
         """Log incoming order to WAL, execute against order book, and log trades.
@@ -1335,6 +1417,7 @@ class PersistedMatchingEngine:
         Returns:
             List of executed Trade records.
         """
+        self._check_open()
         # 1. Write-Ahead Log: Log the order before or as it enters the engine
         if self._async_worker is not None:
             self._async_worker.submit_order(order)
@@ -1364,6 +1447,7 @@ class PersistedMatchingEngine:
         Returns:
             The cancelled Order instance.
         """
+        self._check_open()
         if self._async_worker is not None:
             self._async_worker.submit_cancel(order_id)
         else:
@@ -1416,8 +1500,14 @@ class PersistedMatchingEngine:
         """Active TradeStore instance if configured."""
         return self._trade_store
 
+    @property
+    def is_closed(self) -> bool:
+        """True if the engine and its persistence resources are closed."""
+        return self._is_closed
+
     def flush(self) -> None:
         """Flush internal buffers and WAL to disk."""
+        self._check_open()
         if self._async_worker is not None:
             self._async_worker.flush()
         else:
@@ -1427,6 +1517,7 @@ class PersistedMatchingEngine:
 
     def sync(self) -> None:
         """Force physical disk synchronization."""
+        self._check_open()
         if self._async_worker is not None:
             self._async_worker.flush()
         self._wal.sync()
@@ -1435,6 +1526,9 @@ class PersistedMatchingEngine:
 
     def close(self) -> None:
         """Flush and safely close persistence resources."""
+        if self._is_closed:
+            return
+        self._is_closed = True
         if self._async_worker is not None:
             self._async_worker.close()
         if self._owns_wal:

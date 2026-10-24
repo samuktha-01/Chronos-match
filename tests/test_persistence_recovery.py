@@ -49,6 +49,8 @@ from chronosmatch.persistence import (
     WALTruncatedRecordError,
     WALWriteError,
     WriteAheadLog,
+    decode_trade_payload,
+    encode_trade_payload,
 )
 from chronosmatch.pipeline import TradingPipeline, create_pipeline
 
@@ -309,6 +311,157 @@ class TestTradePersistence:
         with TradeStore(filepath=trade_file) as store:
             assert store.count() == 1
             assert store.get_trade(10) == t1
+
+    def test_persist_single_trade_in_memory_and_disk(self, tmp_path: Path) -> None:
+        """Verify persisting a single trade preserves all fields and reloads faithfully."""
+        trade_file = tmp_path / "single_trade.dat"
+        trade = Trade(
+            trade_id=1,
+            resting_order_id="MAKER-001",
+            incoming_order_id="TAKER-001",
+            price=150.75,
+            quantity=50,
+            timestamp=1234567890,
+        )
+
+        # 1. In-memory store
+        mem_store = TradeStore()
+        mem_store.append_trade(trade)
+        assert mem_store.count() == 1
+        assert mem_store.total_volume() == 50
+        assert mem_store.get_trade(1) == trade
+        assert mem_store.get_trades_for_order("MAKER-001") == [trade]
+        assert mem_store.get_trades_for_order("TAKER-001") == [trade]
+
+        # 2. Disk-backed store
+        with TradeStore(filepath=trade_file, durability=DurabilityPolicy.IMMEDIATE_SYNC) as disk_store:
+            disk_store.append_trade(trade)
+            assert disk_store.count() == 1
+            assert disk_store.total_volume() == 50
+
+        assert trade_file.stat().st_size == TRADE_PAYLOAD_SIZE
+
+        # 3. Reload from disk
+        with TradeStore(filepath=trade_file) as disk_store2:
+            assert disk_store2.count() == 1
+            assert disk_store2.total_volume() == 50
+            loaded = disk_store2.get_trade(1)
+            assert loaded is not None
+            assert loaded.trade_id == 1
+            assert loaded.resting_order_id == "MAKER-001"
+            assert loaded.incoming_order_id == "TAKER-001"
+            assert loaded.maker_order_id == "MAKER-001"
+            assert loaded.taker_order_id == "TAKER-001"
+            assert loaded.price == 150.75
+            assert loaded.execution_price == 150.75
+            assert loaded.quantity == 50
+            assert loaded.executed_quantity == 50
+            assert loaded.execution_qty == 50
+            assert loaded.timestamp == 1234567890
+            assert loaded.timestamp_ns == 1234567890
+
+    def test_persist_multiple_trades_order_and_volume_preservation(self, tmp_path: Path) -> None:
+        """Verify persisting multiple trades preserves strict ordering, volume, and multi-order index."""
+        trade_file = tmp_path / "multiple_trades.dat"
+        trades = [
+            Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100),
+            Trade(trade_id=2, resting_order_id="M1", incoming_order_id="T2", price=100.5, quantity=25, timestamp=200),
+            Trade(trade_id=3, resting_order_id="M2", incoming_order_id="T3", price=101.0, quantity=15, timestamp=300),
+            Trade(trade_id=4, resting_order_id="M3", incoming_order_id="T1", price=102.25, quantity=30, timestamp=400),
+        ]
+
+        with TradeStore(filepath=trade_file, durability=DurabilityPolicy.FLUSH_ON_WRITE) as store:
+            store.append_trades(trades)
+            assert store.count() == 4
+            assert store.total_volume() == 80
+            assert store.get_all_trades() == trades
+            assert store.get_trades_for_order("M1") == [trades[0], trades[1]]
+            assert store.get_trades_for_order("T1") == [trades[0], trades[3]]
+
+        assert trade_file.stat().st_size == 4 * TRADE_PAYLOAD_SIZE
+
+        # Reload and confirm strict ordering and state consistency
+        with TradeStore(filepath=trade_file) as reloaded:
+            assert reloaded.count() == 4
+            assert reloaded.total_volume() == 80
+            reloaded_trades = reloaded.get_all_trades()
+            assert len(reloaded_trades) == 4
+            for orig, rec in zip(trades, reloaded_trades):
+                assert orig == rec
+            assert reloaded.get_trades_for_order("M1") == [trades[0], trades[1]]
+            assert reloaded.get_trades_for_order("T1") == [trades[0], trades[3]]
+
+    def test_trade_payload_serialization_and_deserialization_fidelity(self) -> None:
+        """Verify binary serialization round-trip fidelity across float, int, and Decimal price types."""
+        test_cases = [
+            Trade(trade_id=101, resting_order_id="ORD-M-1", incoming_order_id="ORD-T-1", price=125.50, quantity=100, timestamp=1000),
+            Trade(trade_id="TRD-STR-99", resting_order_id="ORD-M-2", incoming_order_id="ORD-T-2", price=250, quantity=50, timestamp=2000),
+            Trade(trade_id=999999, resting_order_id="ORD-M-3", incoming_order_id="ORD-T-3", price=Decimal("175.12345678"), quantity=75, timestamp=3000),
+        ]
+
+        for trade in test_cases:
+            payload = encode_trade_payload(trade)
+            assert len(payload) == TRADE_PAYLOAD_SIZE
+            decoded = decode_trade_payload(payload)
+
+            assert decoded.trade_id == trade.trade_id
+            assert type(decoded.trade_id) is type(trade.trade_id)
+            assert decoded.resting_order_id == trade.resting_order_id
+            assert decoded.incoming_order_id == trade.incoming_order_id
+            assert decoded.maker_order_id == trade.maker_order_id
+            assert decoded.taker_order_id == trade.taker_order_id
+            assert decoded.price == trade.price
+            assert type(decoded.price) is type(trade.price)
+            assert decoded.quantity == trade.quantity
+            assert decoded.timestamp == trade.timestamp
+
+    def test_trade_payload_corrupted_payload_handling(self) -> None:
+        """Verify decoding corrupted or mis-sized payloads raises appropriate ValueError."""
+        # 1. Invalid payload size
+        with pytest.raises(ValueError, match="Expected 128 bytes"):
+            decode_trade_payload(b"\x00" * 64)
+
+        # 2. Corrupted price ticks
+        valid_trade = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=10)
+        valid_payload = bytearray(encode_trade_payload(valid_trade))
+
+        # Corrupt price ticks to <= 0
+        struct.pack_into("<q", valid_payload, 96, -500)
+        with pytest.raises(ValueError, match="price ticks must be strictly positive"):
+            decode_trade_payload(bytes(valid_payload))
+
+        # Corrupt price type code to invalid value
+        struct.pack_into("<B", valid_payload, 108, 99)
+        with pytest.raises(ValueError):
+            decode_trade_payload(bytes(valid_payload))
+
+    def test_duplicate_trade_timestamp_mismatch_raises(self) -> None:
+        """Verify duplicate trade ID with conflicting timestamp raises DuplicateTradeError."""
+        store = TradeStore()
+        t1 = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=1000)
+        t1_diff_ts = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=2000)
+
+        store.append_trade(t1)
+        with pytest.raises(DuplicateTradeError, match="conflicting data"):
+            store.append_trade(t1_diff_ts)
+
+    def test_duplicate_write_idempotency_multiple_calls(self, tmp_path: Path) -> None:
+        """Verify idempotent repeated writes do not duplicate records on disk or in memory."""
+        trade_file = tmp_path / "idempotent_trades.dat"
+        t1 = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=1000)
+        t2 = Trade(trade_id=2, resting_order_id="M2", incoming_order_id="T2", price=105.0, quantity=20, timestamp=2000)
+
+        with TradeStore(filepath=trade_file) as store:
+            store.append_trades([t1, t2])
+            # Re-append exact same trades
+            store.append_trade(t1)
+            store.append_trades([t1, t2])
+
+            assert store.count() == 2
+            assert store.total_volume() == 30
+
+        # Disk file size must reflect exactly 2 payloads, not 5
+        assert trade_file.stat().st_size == 2 * TRADE_PAYLOAD_SIZE
 
 
 # ==============================================================================
@@ -789,6 +942,197 @@ class TestPersistenceFailuresAndShutdown:
             assert "Disk full" in str(exc.value)
 
         wal.close()
+
+    def test_trade_store_write_failure_preserves_atomic_consistency(self, tmp_path: Path) -> None:
+        """Verify simulated I/O failure during TradeStore append raises PersistenceError without dirty in-memory state."""
+        trade_file = tmp_path / "trade_io_fail.dat"
+        t1 = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100)
+        t2_failing = Trade(trade_id=2, resting_order_id="M2", incoming_order_id="T2", price=105.0, quantity=20, timestamp=200)
+        t3_succeeding = Trade(trade_id=3, resting_order_id="M3", incoming_order_id="T3", price=110.0, quantity=30, timestamp=300)
+
+        store = TradeStore(filepath=trade_file)
+        store.append_trade(t1)
+        assert store.count() == 1
+        assert store.total_volume() == 10
+        assert trade_file.stat().st_size == 1 * TRADE_PAYLOAD_SIZE
+
+        # Simulate disk full on second trade write
+        with patch.object(store._file, "write", side_effect=OSError("Disk full")):
+            with pytest.raises(PersistenceError, match="Failed to append trade to disk"):
+                store.append_trade(t2_failing)
+
+        # In-memory state MUST remain clean and uncorrupted
+        assert store.count() == 1
+        assert store.total_volume() == 10
+        assert store.get_trade(2) is None
+        assert store.get_trades_for_order("M2") == []
+        assert trade_file.stat().st_size == 1 * TRADE_PAYLOAD_SIZE
+
+        # Subsequent valid trade append succeeds cleanly
+        store.append_trade(t3_succeeding)
+        assert store.count() == 2
+        assert store.total_volume() == 40
+        assert store.get_trade(3) == t3_succeeding
+        assert trade_file.stat().st_size == 2 * TRADE_PAYLOAD_SIZE
+        store.close()
+
+        # Reopen from disk and verify exact data integrity
+        with TradeStore(filepath=trade_file) as reloaded:
+            assert reloaded.count() == 2
+            assert reloaded.total_volume() == 40
+            assert reloaded.get_trade(1) == t1
+            assert reloaded.get_trade(3) == t3_succeeding
+
+    def test_trade_store_flush_and_sync_failures_surfaced(self, tmp_path: Path) -> None:
+        """Verify simulated flush and fsync errors raise PersistenceError explicitly."""
+        trade_file = tmp_path / "sync_fail.dat"
+        store = TradeStore(filepath=trade_file)
+        t1 = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100)
+        store.append_trade(t1)
+
+        with patch.object(store._file, "flush", side_effect=OSError("Flush I/O error")):
+            with pytest.raises(PersistenceError, match="Failed to flush trade store"):
+                store.flush()
+
+        with patch("os.fsync", side_effect=OSError("Sync I/O error")):
+            with pytest.raises(PersistenceError, match="Failed to sync trade store"):
+                store.sync()
+
+        store.close()
+
+    def test_operations_on_closed_trade_store_raise(self, tmp_path: Path) -> None:
+        """Verify mutating or flushing operations on a closed TradeStore raise PersistenceError."""
+        trade_file = tmp_path / "closed_store.dat"
+        store = TradeStore(filepath=trade_file)
+        store.close()
+        assert store.is_closed
+
+        t = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100)
+        with pytest.raises(PersistenceError, match="TradeStore is closed"):
+            store.append_trade(t)
+
+        with pytest.raises(PersistenceError, match="TradeStore is closed"):
+            store.append_trades([t])
+
+        with pytest.raises(PersistenceError, match="TradeStore is closed"):
+            store.flush()
+
+        with pytest.raises(PersistenceError, match="TradeStore is closed"):
+            store.sync()
+
+    def test_trade_store_close_is_idempotent(self, tmp_path: Path) -> None:
+        """Verify calling close() multiple times on TradeStore is safe and idempotent."""
+        trade_file = tmp_path / "idempotent_store.dat"
+        store = TradeStore(filepath=trade_file)
+        store.close()
+        store.close()
+        store.close()
+        assert store.is_closed
+
+    def test_async_worker_surfaces_write_failure_without_deadlock(self, tmp_path: Path) -> None:
+        """Verify AsyncPersistenceWorker surfaces write failure explicitly and does not hang on flush/close."""
+        wal_file = tmp_path / "async_fail.wal"
+        trade_file = tmp_path / "async_fail_trades.dat"
+
+        wal = WriteAheadLog(wal_file, durability=DurabilityPolicy.ASYNC_BUFFERED)
+        trade_store = TradeStore(trade_file)
+
+        worker = AsyncPersistenceWorker(wal=wal, trade_store=trade_store, flush_interval_s=0.01)
+
+        # Force write failure on the underlying WAL
+        with patch.object(wal._file, "write", side_effect=OSError("Disk failure in worker")):
+            trade = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100)
+            worker.submit_trade(trade)
+
+            # flush() must unblock and raise PersistenceError
+            with pytest.raises(PersistenceError, match="Async persistence worker background failure"):
+                worker.flush()
+
+            # Subsequent submit must also raise
+            with pytest.raises(PersistenceError):
+                worker.submit_trade(trade)
+
+            # close() should safely shut down without hanging
+            with pytest.raises(PersistenceError):
+                worker.close()
+
+        wal.close()
+        trade_store.close()
+
+    def test_async_worker_normal_shutdown_flushes_pending_writes(self, tmp_path: Path) -> None:
+        """Verify AsyncPersistenceWorker.close() cleanly flushes all pending records before stopping."""
+        wal_file = tmp_path / "async_shutdown.wal"
+        trade_file = tmp_path / "async_shutdown_trades.dat"
+
+        wal = WriteAheadLog(wal_file, durability=DurabilityPolicy.ASYNC_BUFFERED)
+        trade_store = TradeStore(trade_file)
+
+        worker = AsyncPersistenceWorker(wal=wal, trade_store=trade_store, flush_interval_s=0.01)
+
+        trades = [
+            Trade(trade_id=i, resting_order_id=f"M{i}", incoming_order_id=f"T{i}", price=100.0 + i, quantity=10, timestamp=i * 100)
+            for i in range(1, 21)
+        ]
+
+        for t in trades:
+            worker.submit_trade(t)
+
+        # Immediate close: must drain queue, flush to disk, and join worker thread cleanly
+        worker.close()
+        assert worker._is_closed
+        wal.close()
+        trade_store.close()
+
+        # Reopen TradeStore from disk and verify all 20 trades were committed
+        with TradeStore(trade_file) as reader:
+            assert reader.count() == 20
+            assert reader.total_volume() == 200
+            for t in trades:
+                assert reader.get_trade(t.trade_id) == t
+
+        # Submissions after close must fail
+        with pytest.raises(PersistenceError, match="AsyncPersistenceWorker is closed"):
+            worker.submit_trade(trades[0])
+
+    def test_persisted_matching_engine_closed_guards_and_clean_shutdown(self, tmp_path: Path) -> None:
+        """Verify PersistedMatchingEngine guards closed state and flushes cleanly on shutdown."""
+        wal_file = tmp_path / "pme_shutdown.wal"
+        trade_file = tmp_path / "pme_shutdown_trades.dat"
+
+        store = TradeStore(trade_file)
+        engine = PersistedMatchingEngine(wal_path=wal_file, trade_store=store)
+
+        o1 = Order(order_id="BUY-1", side=OrderSide.BUY, price=100.0, quantity=10, timestamp=100)
+        o2 = Order(order_id="SELL-1", side=OrderSide.SELL, price=100.0, quantity=10, timestamp=200)
+
+        trades1 = engine.process_order(o1)
+        assert len(trades1) == 0
+        trades2 = engine.process_order(o2)
+        assert len(trades2) == 1
+
+        engine.close()
+        assert engine.is_closed
+
+        # Idempotent close
+        engine.close()
+
+        # Mutating operations on closed engine raise PersistenceError
+        with pytest.raises(PersistenceError, match="PersistedMatchingEngine is closed"):
+            engine.process_order(Order(order_id="BUY-2", side=OrderSide.BUY, price=100.0, quantity=5, timestamp=300))
+
+        with pytest.raises(PersistenceError, match="PersistedMatchingEngine is closed"):
+            engine.cancel_order("BUY-1")
+
+        with pytest.raises(PersistenceError, match="PersistedMatchingEngine is closed"):
+            engine.flush()
+
+        with pytest.raises(PersistenceError, match="PersistedMatchingEngine is closed"):
+            engine.sync()
+
+        # Verify disk files were cleanly committed and can be reloaded
+        with TradeStore(trade_file) as reader:
+            assert reader.count() == 1
+            assert reader.get_trade(trades2[0].trade_id) == trades2[0]
 
 
 # ==============================================================================
