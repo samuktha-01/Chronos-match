@@ -40,6 +40,7 @@ from chronosmatch.persistence import (
     RecoveryManager,
     RecoveryResult,
     TRADE_PAYLOAD_SIZE,
+    TradeRecoveryResult,
     TradeStore,
     WALClosedError,
     WALCorruptedRecordError,
@@ -1209,3 +1210,302 @@ class TestPipelineIntegrationWithPersistence:
         assert "B1" not in pipe2.engine.order_book
 
         pipe2.close()
+
+
+# ==============================================================================
+# 12. Trade History Recovery and Restart Validation
+# ==============================================================================
+
+
+class TestTradeHistoryRecoveryAndRestartValidation:
+    """Validate safe trade-history recovery after application restarts without book pollution."""
+
+    def test_recover_trade_history_reopen_storage(self, tmp_path: Path) -> None:
+        """Verify trade history recovery after creating, closing, and reopening TradeStore."""
+        trade_file = tmp_path / "hist_reopen.dat"
+        trades = [
+            Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100),
+            Trade(trade_id=2, resting_order_id="M1", incoming_order_id="T2", price=100.5, quantity=20, timestamp=200),
+            Trade(trade_id=3, resting_order_id="M2", incoming_order_id="T3", price=101.0, quantity=30, timestamp=300),
+        ]
+
+        # Session 1: Create and write trades
+        with TradeStore(trade_file) as store1:
+            store1.append_trades(trades)
+            assert store1.count() == 3
+
+        # Session 2: Reopen storage and run recovery
+        with TradeStore(trade_file) as store2:
+            res: TradeRecoveryResult = store2.recover_trade_history(strict=True)
+            assert res.is_clean
+            assert res.recovered_count == 3
+            assert res.total_volume == 60
+            assert res.truncated_bytes_skipped == 0
+            assert res.corrupted_records_count == 0
+            assert len(res.recovered_trades) == 3
+            assert res.recovered_trades == trades
+
+        # Session 3: Initialize PersistedMatchingEngine with recover_trades=True
+        wal_file = tmp_path / "hist_reopen.wal"
+        with TradeStore(trade_file) as store3:
+            pme = PersistedMatchingEngine(
+                wal_path=wal_file,
+                trade_store=store3,
+                recover_trades=True,
+            )
+            assert pme.total_trades == 3
+            assert pme.total_volume_traded == 60
+            assert pme.trades == trades
+            pme.close()
+
+    def test_recovery_preserves_all_supported_fields(self, tmp_path: Path) -> None:
+        """Verify recovered trades faithfully preserve trade IDs, price types, quantities, and timestamps."""
+        trade_file = tmp_path / "fields_preservation.dat"
+        original_trades = [
+            Trade(trade_id=101, resting_order_id="ORD-MAKER-01", incoming_order_id="ORD-TAKER-01", price=99.75, quantity=15, timestamp=111111111),
+            Trade(trade_id="TRD-UUID-002", resting_order_id="ORD-MAKER-02", incoming_order_id="ORD-TAKER-02", price=250, quantity=40, timestamp=222222222),
+            Trade(trade_id=303, resting_order_id="ORD-MAKER-03", incoming_order_id="ORD-TAKER-03", price=Decimal("175.12345678"), quantity=85, timestamp=333333333),
+        ]
+
+        with TradeStore(trade_file) as store:
+            store.append_trades(original_trades)
+
+        with TradeStore(trade_file) as reloaded_store:
+            res = reloaded_store.recover_trade_history(strict=True)
+            assert res.recovered_count == 3
+            recovered = res.recovered_trades
+
+            for orig, rec in zip(original_trades, recovered):
+                # Trade ID preservation and exact type
+                assert rec.trade_id == orig.trade_id
+                assert type(rec.trade_id) is type(orig.trade_id)
+
+                # Order identifiers and domain aliases
+                assert rec.resting_order_id == orig.resting_order_id
+                assert rec.maker_order_id == orig.maker_order_id
+                assert rec.incoming_order_id == orig.incoming_order_id
+                assert rec.taker_order_id == orig.taker_order_id
+
+                # Execution price and exact numeric type
+                assert rec.price == orig.price
+                assert rec.execution_price == orig.execution_price
+                assert type(rec.price) is type(orig.price)
+
+                # Quantities and aliases
+                assert rec.quantity == orig.quantity
+                assert rec.executed_quantity == orig.executed_quantity
+                assert rec.execution_qty == orig.execution_qty
+
+                # Nanosecond timestamp
+                assert rec.timestamp == orig.timestamp
+                assert rec.timestamp_ns == orig.timestamp_ns
+
+    def test_repeated_recovery_prevents_duplicate_records(self, tmp_path: Path) -> None:
+        """Verify repeated recovery or retries do not duplicate trade records in memory or on disk."""
+        trade_file = tmp_path / "repeat_recovery.dat"
+        trades = [
+            Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=50.0, quantity=10, timestamp=100),
+            Trade(trade_id=2, resting_order_id="M2", incoming_order_id="T2", price=55.0, quantity=20, timestamp=200),
+        ]
+
+        with TradeStore(trade_file) as store:
+            store.append_trades(trades)
+            assert store.count() == 2
+
+            # Repeated recovery on the same store instance
+            res1 = store.recover_trade_history(strict=True)
+            res2 = store.recover_trade_history(strict=True)
+            res3 = store.recover_trade_history(strict=True)
+
+            assert store.count() == 2
+            assert store.total_volume() == 30
+            assert len(store.get_all_trades()) == 2
+            assert res2.duplicate_records_skipped == 2
+            assert res3.duplicate_records_skipped == 2
+
+        # Engine level repeated recovery
+        engine = MatchingEngine()
+        loaded_count_1 = engine.load_trade_history(trades)
+        loaded_count_2 = engine.load_trade_history(trades)
+        loaded_count_3 = engine.load_trade_history(trades)
+
+        assert loaded_count_1 == 2
+        assert loaded_count_2 == 0
+        assert loaded_count_3 == 0
+        assert engine.total_trades == 2
+        assert engine.total_volume_traded == 30
+        assert len(engine.trades) == 2
+
+    def test_recovery_incomplete_final_record_strict_and_salvage(self, tmp_path: Path) -> None:
+        """Verify incomplete trailing records raise in strict mode and salvage cleanly in non-strict mode."""
+        trade_file = tmp_path / "incomplete_final.dat"
+        t1 = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100)
+        t2 = Trade(trade_id=2, resting_order_id="M2", incoming_order_id="T2", price=102.0, quantity=20, timestamp=200)
+
+        with TradeStore(trade_file) as store:
+            store.append_trades([t1, t2])
+        assert trade_file.stat().st_size == 2 * TRADE_PAYLOAD_SIZE
+
+        # Simulate trailing crash leaving 53 partial bytes
+        with open(trade_file, "ab") as f:
+            f.write(b"PARTIAL_TRAILING_BYTES" * 2 + b"123456789")
+        assert trade_file.stat().st_size == (2 * TRADE_PAYLOAD_SIZE) + 53
+
+        # Strict recovery MUST explicitly raise PersistenceError on initialization and explicit recovery
+        with pytest.raises(PersistenceError, match="Incomplete trailing record at offset 256"):
+            TradeStore(trade_file, strict_recovery=True)
+
+        with TradeStore(trade_file) as store_strict:
+            with pytest.raises(PersistenceError, match="Incomplete trailing record at offset 256"):
+                store_strict.recover_trade_history(strict=True)
+
+        # Salvage mode MUST recover valid prefix, report warnings, and truncate trailing noise
+        with TradeStore(trade_file) as store_salvage:
+            res = store_salvage.recover_trade_history(strict=False, truncate_corrupted=True)
+            assert not res.is_clean
+            assert res.recovered_count == 2
+            assert res.truncated_bytes_skipped == 53
+            assert len(res.warnings) == 1
+            assert "Incomplete trailing record" in res.warnings[0]
+            assert store_salvage.get_all_trades() == [t1, t2]
+
+        # File on disk must now be cleanly aligned back to 256 bytes
+        assert trade_file.stat().st_size == 2 * TRADE_PAYLOAD_SIZE
+
+    def test_recovery_corrupted_record_handling_strict_and_salvage(self, tmp_path: Path) -> None:
+        """Verify corrupted records raise in strict mode and halt safely in salvage mode."""
+        trade_file = tmp_path / "corrupted_record.dat"
+        t1 = Trade(trade_id=1, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100)
+        t2 = Trade(trade_id=2, resting_order_id="M2", incoming_order_id="T2", price=105.0, quantity=20, timestamp=200)
+
+        with TradeStore(trade_file) as store:
+            store.append_trades([t1, t2])
+
+        # Append a 128-byte block with corrupted payload (non-positive price ticks)
+        corrupted_payload = bytearray(encode_trade_payload(t1))
+        struct.pack_into("<q", corrupted_payload, 96, -99999)  # Corrupt price ticks to negative
+        with open(trade_file, "ab") as f:
+            f.write(bytes(corrupted_payload))
+
+        assert trade_file.stat().st_size == 3 * TRADE_PAYLOAD_SIZE
+
+        # Strict recovery MUST raise PersistenceError reporting corruption
+        with pytest.raises(PersistenceError, match="Corrupted trade record at offset 256"):
+            TradeStore(trade_file, strict_recovery=True)
+
+        with TradeStore(trade_file) as store_strict:
+            with pytest.raises(PersistenceError, match="Corrupted trade record at offset 256"):
+                store_strict.recover_trade_history(strict=True)
+
+        # Salvage mode halts at corruption boundary, recovers intact preceding trades, and reports diagnostics
+        with TradeStore(trade_file) as store_salvage:
+            res = store_salvage.recover_trade_history(strict=False, truncate_corrupted=True)
+            assert res.recovered_count == 2
+            assert res.corrupted_records_count == 1
+            assert len(res.warnings) >= 1
+            assert "Corrupted trade record" in res.warnings[0]
+            assert store_salvage.get_all_trades() == [t1, t2]
+
+        # Truncation trimmed corrupted block back to 256 bytes
+        assert trade_file.stat().st_size == 2 * TRADE_PAYLOAD_SIZE
+
+    def test_recovery_empty_and_missing_storage(self, tmp_path: Path) -> None:
+        """Verify empty files recover cleanly and missing files are reported explicitly."""
+        # 1. 0-byte storage file
+        empty_file = tmp_path / "empty_trades.dat"
+        empty_file.touch()
+
+        with TradeStore(empty_file) as store:
+            res = store.recover_trade_history(strict=True)
+            assert res.is_clean
+            assert res.recovered_count == 0
+            assert res.total_volume == 0
+            assert store.count() == 0
+
+        # 2. Non-existent storage file with create=False raises FileNotFoundError
+        missing_file = tmp_path / "non_existent.dat"
+        with pytest.raises(FileNotFoundError, match="Trade storage file '.*' does not exist"):
+            TradeStore(missing_file, create=False)
+
+        # 3. Non-existent WAL file passed to TradeStore.from_wal raises FileNotFoundError
+        missing_wal = tmp_path / "missing.wal"
+        with pytest.raises(FileNotFoundError, match="WAL file '.*' does not exist"):
+            TradeStore.from_wal(missing_wal)
+
+    def test_recovery_errors_reported_clearly(self, tmp_path: Path) -> None:
+        """Verify closed store operations, conflicting trades, and non-Trade inputs raise clear errors."""
+        trade_file = tmp_path / "error_reporting.dat"
+        store = TradeStore(trade_file)
+        store.close()
+
+        # Calling recovery on closed store
+        with pytest.raises(PersistenceError, match="TradeStore is closed"):
+            store.recover_trade_history()
+
+        # Passing non-Trade objects to engine.load_trade_history
+        engine = MatchingEngine()
+        with pytest.raises(TypeError, match="Expected Trade instance, got str"):
+            engine.load_trade_history(["not_a_trade"])  # type: ignore
+
+        # Conflicting trade ID during load_trade_history
+        t1 = Trade(trade_id=10, resting_order_id="M1", incoming_order_id="T1", price=100.0, quantity=10, timestamp=100)
+        t1_conflict = Trade(trade_id=10, resting_order_id="M1", incoming_order_id="T1", price=999.0, quantity=10, timestamp=100)
+        engine.load_trade_history([t1])
+        with pytest.raises(DuplicateTradeError, match="conflicts with existing trade"):
+            engine.load_trade_history([t1_conflict])
+
+    def test_matching_engine_behavior_and_trade_ids_after_recovery(self, tmp_path: Path) -> None:
+        """Verify matching engine preserves order book isolation and continues monotonic trade IDs after trade recovery."""
+        trade_file = tmp_path / "continuity_trades.dat"
+        wal_file = tmp_path / "continuity.wal"
+
+        # Step 1: Pre-populate persistent trade store with 3 historical trades (IDs 1, 2, 3)
+        historical_trades = [
+            Trade(trade_id=1, resting_order_id="HIST-M1", incoming_order_id="HIST-T1", price=100.0, quantity=10, timestamp=10),
+            Trade(trade_id=2, resting_order_id="HIST-M2", incoming_order_id="HIST-T2", price=101.0, quantity=20, timestamp=20),
+            Trade(trade_id=3, resting_order_id="HIST-M3", incoming_order_id="HIST-T3", price=102.0, quantity=30, timestamp=30),
+        ]
+        with TradeStore(trade_file) as seed_store:
+            seed_store.append_trades(historical_trades)
+
+        # Step 2: Restart engine with trade recovery requested
+        store = TradeStore(trade_file)
+        pme = PersistedMatchingEngine(
+            wal_path=wal_file,
+            trade_store=store,
+            recover_trades=True,
+        )
+
+        # Confirm trade history is recovered
+        assert pme.total_trades == 3
+        assert pme.total_volume_traded == 60
+        assert [t.trade_id for t in pme.trades] == [1, 2, 3]
+
+        # Crucial architectural boundary: Order book state MUST remain empty and unpolluted
+        assert pme.order_book.best_bid is None
+        assert pme.order_book.best_ask is None
+        assert pme.spread is None
+
+        # Step 3: Execute a new trade in the restarted engine
+        # Maker order rests in book
+        t_maker = pme.process_order(Order(order_id="NEW-BUY", side=OrderSide.BUY, price=150.0, quantity=50, timestamp=100))
+        assert len(t_maker) == 0
+        assert pme.order_book.best_bid == 150.0
+
+        # Aggressive taker crosses book
+        t_taker = pme.process_order(Order(order_id="NEW-SELL", side=OrderSide.SELL, price=150.0, quantity=50, timestamp=200))
+        assert len(t_taker) == 1
+
+        # The new trade MUST have trade_id = 4 (strictly monotonic, no collision with historical trades 1, 2, 3)
+        new_trade = t_taker[0]
+        assert new_trade.trade_id == 4
+        assert new_trade.price == 150.0
+        assert new_trade.quantity == 50
+
+        # Engine totals now reflect historical + new executions
+        assert pme.total_trades == 4
+        assert pme.total_volume_traded == 110
+        assert [t.trade_id for t in pme.trades] == [1, 2, 3, 4]
+
+        pme.close()
+        store.close()

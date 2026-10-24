@@ -224,6 +224,28 @@ class RecoveryResult:
         return len(self.warnings) == 0 and self.truncated_bytes_skipped == 0
 
 
+@dataclass
+class TradeRecoveryResult:
+    """Diagnostic outcome of trade-history recovery from persistent storage."""
+
+    recovered_trades: list[Trade] = field(default_factory=list)
+    recovered_count: int = 0
+    total_volume: int = 0
+    truncated_bytes_skipped: int = 0
+    corrupted_records_count: int = 0
+    duplicate_records_skipped: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def is_clean(self) -> bool:
+        """True if recovery finished without warnings, corruptions, or truncated trailing records."""
+        return (
+            len(self.warnings) == 0
+            and self.truncated_bytes_skipped == 0
+            and self.corrupted_records_count == 0
+        )
+
+
 # ==============================================================================
 # Exceptions
 # ==============================================================================
@@ -813,6 +835,9 @@ class TradeStore:
         self,
         filepath: str | Path | None = None,
         durability: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
+        *,
+        create: bool = True,
+        strict_recovery: bool = False,
     ) -> None:
         """Initialize the TradeStore.
 
@@ -820,9 +845,13 @@ class TradeStore:
             filepath: Optional backing file path for append-only binary persistence.
                 If None, operates as an in-memory trade repository.
             durability: DurabilityPolicy for disk flushes.
+            create: If True, creates file and parent directories if non-existent.
+                If False and filepath does not exist, raises FileNotFoundError.
+            strict_recovery: If True, raises PersistenceError on incomplete or corrupted records.
         """
         self._filepath = Path(filepath) if filepath is not None else None
         self._durability = DurabilityPolicy(durability)
+        self._strict_recovery = strict_recovery
         self._trades: list[Trade] = []
         self._trades_by_id: dict[int | str, Trade] = {}
         self._trades_by_order: dict[str, list[Trade]] = {}
@@ -832,51 +861,177 @@ class TradeStore:
         self._file: BinaryIO | None = None
 
         if self._filepath is not None:
+            if not create and not self._filepath.exists():
+                raise FileNotFoundError(f"Trade storage file '{self._filepath}' does not exist.")
             self._filepath.parent.mkdir(parents=True, exist_ok=True)
             mode = "r+b" if self._filepath.exists() and self._filepath.stat().st_size > 0 else "w+b"
             self._file = open(self._filepath, mode)
             self._load_existing_trades()
 
     def _load_existing_trades(self) -> None:
-        """Read any previously persisted trades from the backing file.
+        """Read any previously persisted trades from the backing file on initialization."""
+        self.recover_trade_history(strict=self._strict_recovery, truncate_corrupted=False)
 
-        Safely recovers all fully-formed trade records and truncates any
-        trailing incomplete or corrupted records from prior crashes, aligning
-        the write pointer to the next valid record boundary.
-        """
+    def truncate_to_valid(self, valid_offset: int | None = None) -> None:
+        """Truncate backing file to a valid byte offset, removing trailing corrupt or partial data."""
+        if self._is_closed:
+            raise PersistenceError("TradeStore is closed.")
         if self._file is None:
             return
-        self._file.seek(0, os.SEEK_END)
-        size = self._file.tell()
-        if size == 0:
-            return
-
-        self._file.seek(0)
-        while True:
-            payload = self._file.read(TRADE_PAYLOAD_SIZE)
-            if len(payload) < TRADE_PAYLOAD_SIZE:
-                break
-            try:
-                trade = decode_trade_payload(payload)
-                self._index_trade(trade)
-            except Exception:
-                break
-
-        valid_bytes = len(self._trades) * TRADE_PAYLOAD_SIZE
-        if size != valid_bytes:
-            self._file.seek(valid_bytes)
-            self._file.truncate(valid_bytes)
+        with self._lock:
+            if valid_offset is None:
+                valid_offset = len(self._trades) * TRADE_PAYLOAD_SIZE
+            self._file.seek(valid_offset)
+            self._file.truncate(valid_offset)
             self._file.flush()
-        else:
-            self._file.seek(valid_bytes)
 
-    def _index_trade(self, trade: Trade) -> None:
-        """Index a trade in memory."""
+    def recover_trade_history(
+        self,
+        *,
+        strict: bool = False,
+        truncate_corrupted: bool = False,
+    ) -> TradeRecoveryResult:
+        """Recover persisted trade records from the backing file without executing trades.
+
+        Safely loads and validates all fully-formed trade records.
+        Handles trailing incomplete records and corrupted frames according
+        to the specified recovery policy (strict raises error, non-strict
+        recovers valid prefix and reports diagnostic warnings).
+        Prevents duplicate trade records on repeated calls.
+
+        Args:
+            strict: If True, raises PersistenceError on incomplete or corrupted records.
+                If False, salvages all valid records up to the crash point and reports warnings.
+            truncate_corrupted: If True, truncates any trailing corrupted or partial bytes from file.
+
+        Returns:
+            TradeRecoveryResult containing recovered trades and diagnostics.
+
+        Raises:
+            PersistenceError: If the store is closed, or on data corruption/truncation in strict mode.
+            DuplicateTradeError: If a record with conflicting trade ID is encountered.
+        """
+        if self._is_closed:
+            raise PersistenceError("TradeStore is closed.")
+
+        with self._lock:
+            if self._file is None:
+                return TradeRecoveryResult(
+                    recovered_trades=list(self._trades),
+                    recovered_count=len(self._trades),
+                    total_volume=self._total_volume,
+                )
+
+            self._file.seek(0, os.SEEK_END)
+            total_size = self._file.tell()
+            if total_size == 0:
+                return TradeRecoveryResult()
+
+            self._file.seek(0)
+            pos = 0
+            warnings: list[str] = []
+            corrupted_count = 0
+            duplicate_count = 0
+            truncated_bytes = 0
+            recovered_in_pass: list[Trade] = []
+
+            while pos < total_size:
+                remaining = total_size - pos
+                if remaining < TRADE_PAYLOAD_SIZE:
+                    msg = (
+                        f"Incomplete trailing record at offset {pos} "
+                        f"({remaining} bytes available, expected {TRADE_PAYLOAD_SIZE})"
+                    )
+                    if strict:
+                        raise PersistenceError(msg)
+                    warnings.append(msg)
+                    truncated_bytes = remaining
+                    break
+
+                payload = self._file.read(TRADE_PAYLOAD_SIZE)
+                try:
+                    trade = decode_trade_payload(payload)
+                except Exception as e:
+                    corrupted_count += 1
+                    msg = f"Corrupted trade record at offset {pos}: {e}"
+                    if strict:
+                        raise PersistenceError(msg) from e
+                    warnings.append(msg)
+                    break
+
+                if trade.trade_id in self._trades_by_id:
+                    existing = self._trades_by_id[trade.trade_id]
+                    if (
+                        existing.price != trade.price
+                        or existing.quantity != trade.quantity
+                        or existing.resting_order_id != trade.resting_order_id
+                        or existing.incoming_order_id != trade.incoming_order_id
+                        or existing.timestamp != trade.timestamp
+                    ):
+                        msg = (
+                            f"Conflicting duplicate trade ID '{trade.trade_id}' at offset {pos}: "
+                            f"existing={existing}, new={trade}"
+                        )
+                        if strict:
+                            raise DuplicateTradeError(msg)
+                        warnings.append(msg)
+                        duplicate_count += 1
+                    else:
+                        duplicate_count += 1
+                else:
+                    self._index_trade(trade)
+                    recovered_in_pass.append(trade)
+
+                pos += TRADE_PAYLOAD_SIZE
+
+            # If requested, truncate trailing corrupt or partial data to valid boundary
+            if truncate_corrupted and total_size != pos:
+                self._file.seek(pos)
+                self._file.truncate(pos)
+                self._file.flush()
+            else:
+                self._file.seek(pos)
+
+            return TradeRecoveryResult(
+                recovered_trades=list(self._trades),
+                recovered_count=len(self._trades),
+                total_volume=self._total_volume,
+                truncated_bytes_skipped=truncated_bytes,
+                corrupted_records_count=corrupted_count,
+                duplicate_records_skipped=duplicate_count,
+                warnings=warnings,
+            )
+
+    def _index_trade(self, trade: Trade) -> bool:
+        """Index a trade in memory, preventing duplicates.
+
+        Returns:
+            True if the trade was newly indexed, False if it was already indexed with identical data.
+
+        Raises:
+            DuplicateTradeError: If a trade with identical trade_id but conflicting fields exists.
+        """
+        if trade.trade_id in self._trades_by_id:
+            existing = self._trades_by_id[trade.trade_id]
+            if (
+                existing.price != trade.price
+                or existing.quantity != trade.quantity
+                or existing.resting_order_id != trade.resting_order_id
+                or existing.incoming_order_id != trade.incoming_order_id
+                or existing.timestamp != trade.timestamp
+            ):
+                raise DuplicateTradeError(
+                    f"Trade ID '{trade.trade_id}' already exists with conflicting data: "
+                    f"existing={existing}, new={trade}"
+                )
+            return False
+
         self._trades.append(trade)
         self._trades_by_id[trade.trade_id] = trade
         self._trades_by_order.setdefault(trade.resting_order_id, []).append(trade)
         self._trades_by_order.setdefault(trade.incoming_order_id, []).append(trade)
         self._total_volume += trade.quantity
+        return True
 
     def append_trade(self, trade: Trade) -> None:
         """Persist and index an executed Trade record.
@@ -1020,11 +1175,16 @@ class TradeStore:
         wal_path: str | Path,
         filepath: str | Path | None = None,
         durability: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
+        *,
+        strict: bool = False,
     ) -> TradeStore:
         """Construct a populated TradeStore by extracting all Trade records from a WAL file."""
+        wal_file = Path(wal_path)
+        if not wal_file.exists():
+            raise FileNotFoundError(f"WAL file '{wal_file}' does not exist.")
         store = cls(filepath=filepath, durability=durability)
-        with WriteAheadLog(wal_path, create=False) as wal:
-            records, _, _ = wal.read_records(strict=False)
+        with WriteAheadLog(wal_file, create=False) as wal:
+            records, _, _ = wal.read_records(strict=strict)
             for rec in records:
                 if rec.is_trade and isinstance(rec.data, Trade):
                     store.append_trade(rec.data)
@@ -1373,6 +1533,8 @@ class PersistedMatchingEngine:
         wal: WriteAheadLog | None = None,
         trade_store: TradeStore | None = None,
         durability: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
+        recover_trades: bool = False,
+        strict_recovery: bool = False,
     ) -> None:
         """Initialize PersistedMatchingEngine.
 
@@ -1382,6 +1544,8 @@ class PersistedMatchingEngine:
             wal: Existing WriteAheadLog instance.
             trade_store: Optional dedicated TradeStore instance.
             durability: DurabilityPolicy for persistence operations.
+            recover_trades: If True, automatically recovers persisted trade history into engine.
+            strict_recovery: If True, raises PersistenceError on any recovery corruption.
         """
         self.engine: MatchingEngine = engine if engine is not None else MatchingEngine()
         self._durability = DurabilityPolicy(durability)
@@ -1403,6 +1567,43 @@ class PersistedMatchingEngine:
                 wal=self._wal,
                 trade_store=self._trade_store,
             )
+
+        if recover_trades:
+            self.recover_trade_history(strict=strict_recovery)
+
+    def recover_trade_history(self, *, strict: bool = False) -> list[Trade]:
+        """Recover persisted trade history into the matching engine without replaying orders.
+
+        Loads historical executed trades from the configured TradeStore or WAL,
+        populates the engine's trade list, and synchronizes the trade counter
+        to ensure subsequent executions continue with monotonic identifiers.
+        Does not mutate the order book or execute historical trades.
+
+        Args:
+            strict: If True, raises PersistenceError on truncated or corrupted records.
+
+        Returns:
+            List of recovered Trade instances in historical execution order.
+
+        Raises:
+            PersistenceError: If the engine is closed or recovery fails.
+        """
+        self._check_open()
+        recovered_trades: list[Trade] = []
+
+        if self._trade_store is not None:
+            self._trade_store.recover_trade_history(strict=strict)
+            recovered_trades = self._trade_store.get_all_trades()
+        elif self._wal is not None:
+            records, _, _ = self._wal.read_records(strict=strict)
+            for rec in records:
+                if rec.is_trade and isinstance(rec.data, Trade):
+                    recovered_trades.append(rec.data)
+        else:
+            raise PersistenceError("Cannot recover trade history: neither TradeStore nor WAL is configured.")
+
+        self.engine.load_trade_history(recovered_trades)
+        return list(self.engine.trades)
 
     def _check_open(self) -> None:
         if self._is_closed:

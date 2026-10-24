@@ -162,6 +162,8 @@ class TradingPipeline:
         wal: WriteAheadLog | None = None,
         trade_store: TradeStore | None = None,
         durability_policy: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
+        recover_trades: bool = False,
+        strict_recovery: bool = False,
     ) -> None:
         """Initialize the end-to-end trading pipeline.
 
@@ -175,6 +177,8 @@ class TradingPipeline:
             wal: Existing WriteAheadLog instance.
             trade_store: Optional TradeStore instance for trade persistence.
             durability_policy: Durability guarantee for disk writes.
+            recover_trades: If True, recovers historical trades into the engine.
+            strict_recovery: If True, raises PersistenceError on recovery errors.
         """
         self.config: MarketFeedConfig = config if config is not None else MarketFeedConfig()
         self.metrics: TradingPipelineMetrics = TradingPipelineMetrics()
@@ -214,6 +218,9 @@ class TradingPipeline:
 
         self._is_closed: bool = False
         self._stop_event: asyncio.Event = asyncio.Event()
+
+        if recover_trades:
+            self.recover_trade_history(strict=strict_recovery)
 
     # --------------------------------------------------------------------------
     # Deterministic Single-Step & Manual Ingestion
@@ -663,6 +670,34 @@ class TradingPipeline:
     def is_closed(self) -> bool:
         """True if the pipeline has been closed."""
         return self._is_closed or self._ring_buffer.is_closed
+
+    def recover_trade_history(self, *, strict: bool = False) -> list[Trade]:
+        """Recover persisted trade history into the pipeline's engine without altering the order book.
+
+        Args:
+            strict: If True, raises PersistenceError on truncated or corrupted records.
+
+        Returns:
+            List of recovered Trade instances in historical execution order.
+        """
+        self._check_closed()
+        if hasattr(self.engine, "recover_trade_history"):
+            return self.engine.recover_trade_history(strict=strict)
+
+        recovered_trades: list[Trade] = []
+        if self._trade_store is not None:
+            self._trade_store.recover_trade_history(strict=strict)
+            recovered_trades = self._trade_store.get_all_trades()
+        elif self._wal is not None:
+            records, _, _ = self._wal.read_records(strict=strict)
+            for rec in records:
+                if rec.is_trade and isinstance(rec.data, Trade):
+                    recovered_trades.append(rec.data)
+
+        if hasattr(self.engine, "load_trade_history"):
+            self.engine.load_trade_history(recovered_trades)
+
+        return list(self.trades)
 
     @classmethod
     def recover(

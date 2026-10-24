@@ -276,6 +276,63 @@ class MatchingEngine:
         """Current bid-ask spread in the underlying order book."""
         return self.order_book.spread
 
+    def load_trade_history(self, trades: list[Trade]) -> int:
+        """Load historical trade executions into memory without altering the order book.
+
+        Preserves original trade fields, exact ordering, and monotonic trade ID tracking.
+        Prevents duplicate trade insertion if recovery is retried.
+
+        Args:
+            trades: List of validated Trade executions.
+
+        Returns:
+            Number of newly loaded trades.
+
+        Raises:
+            TypeError: If an element is not a Trade instance.
+            DuplicateTradeError: If a trade conflicts with an existing trade ID.
+        """
+        if not trades:
+            return 0
+
+        existing_by_id: dict[int | str, Trade] = {t.trade_id: t for t in self._trades}
+        new_trades: list[Trade] = []
+
+        for trade in trades:
+            if not isinstance(trade, Trade):
+                raise TypeError(f"Expected Trade instance, got {type(trade).__name__}")
+
+            if trade.trade_id in existing_by_id:
+                existing = existing_by_id[trade.trade_id]
+                if (
+                    existing.price != trade.price
+                    or existing.quantity != trade.quantity
+                    or existing.resting_order_id != trade.resting_order_id
+                    or existing.incoming_order_id != trade.incoming_order_id
+                    or existing.timestamp != trade.timestamp
+                ):
+                    from chronosmatch.persistence import DuplicateTradeError
+
+                    raise DuplicateTradeError(
+                        f"Trade ID '{trade.trade_id}' conflicts with existing trade: "
+                        f"existing={existing}, new={trade}"
+                    )
+                # Idempotent duplicate: skip without duplicating
+                continue
+
+            existing_by_id[trade.trade_id] = trade
+            new_trades.append(trade)
+
+        self._trades.extend(new_trades)
+        if self._trades:
+            highest_id = max(
+                (t.trade_id for t in self._trades if isinstance(t.trade_id, int)),
+                default=0,
+            )
+            self._trade_counter = max(self._trade_counter, highest_id)
+
+        return len(new_trades)
+
     def clear(self) -> None:
         """Reset the matching engine and underlying order book."""
         self.order_book.clear()
