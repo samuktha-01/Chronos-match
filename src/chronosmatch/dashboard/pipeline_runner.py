@@ -110,7 +110,16 @@ class LatencyInstrumentedEngine:
     @property
     def is_cython_accelerated(self) -> bool:
         """True only if underlying engine is a compiled native CythonMatchingEngine."""
-        return is_cython_compiled() and isinstance(self._target, CythonMatchingEngine)
+        if not is_cython_compiled():
+            return False
+        target = self._target
+        while hasattr(target, "target_engine"):
+            target = target.target_engine
+        from chronosmatch.cython_engine import _CompiledCythonMatchingEngine
+
+        if _CompiledCythonMatchingEngine is not None:
+            return isinstance(target, _CompiledCythonMatchingEngine)
+        return False
 
     def __getattr__(self, name: str) -> Any:
         """Delegate all other attribute and method accesses to the underlying engine."""

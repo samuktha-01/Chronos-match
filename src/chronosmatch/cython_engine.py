@@ -265,6 +265,7 @@ class _PyCythonOrderBook:
 
     def remove_order(self, order_id: str) -> Order:
         """Remove and return an order from the book by order_id."""
+        validate_order_id(order_id)
         if order_id not in self._order_id_to_price:
             raise OrderNotFoundError(f"Order '{order_id}' not found in the order book.")
 

@@ -29,6 +29,15 @@ from chronosmatch import (
     get_compilation_status,
     is_cython_compiled,
 )
+from chronosmatch.cython_engine import _PyCythonMatchingEngine
+from chronosmatch.dashboard.metrics import (
+    BoundedLatencyTracker,
+    DashboardMetricsCollector,
+    DashboardMetricsSnapshot,
+)
+from chronosmatch.dashboard.pipeline_runner import LatencyInstrumentedEngine, PipelineDashboardRunner
+from chronosmatch.dashboard.terminal import TerminalDashboard
+from chronosmatch.pipeline import create_pipeline
 
 
 # ==============================================================================
@@ -368,3 +377,180 @@ class TestCythonCompilationStatusAndDiagnostics:
         assert c_path.exists(), "src/chronosmatch/_cython_engine.c must be generated"
         # Cython 3.3.0 generates ~1.2 MB C file
         assert c_path.stat().st_size > 100_000, "Generated C file should be substantial (> 100 KB)"
+
+
+# ==============================================================================
+# 5. Cancellation and Telemetry Engine Detection Tests
+# ==============================================================================
+
+
+class TestCythonCancellationAndEngineDetection:
+    """Verify CythonMatchingEngine order cancellation and dashboard engine detection."""
+
+    def test_cancel_resting_buy_order(self) -> None:
+        """Verify cancellation of a resting buy order updates book state and metrics."""
+        engine = CythonMatchingEngine()
+        engine.process_order(Order("BUY-1", OrderSide.BUY, 99.0, 10))
+        assert engine.best_bid == 99.0
+        assert engine.order_book.bid_volume == 10
+        assert "BUY-1" in engine.order_book
+
+        cancelled = engine.cancel_order("BUY-1")
+        assert cancelled.order_id == "BUY-1"
+        assert cancelled.quantity == 10
+        assert engine.best_bid is None
+        assert engine.order_book.bid_volume == 0
+        assert "BUY-1" not in engine.order_book
+        assert len(engine.order_book) == 0
+
+    def test_cancel_resting_sell_order(self) -> None:
+        """Verify cancellation of a resting sell order updates book state and metrics."""
+        engine = CythonMatchingEngine()
+        engine.process_order(Order("SELL-1", OrderSide.SELL, 101.0, 25))
+        assert engine.best_ask == 101.0
+        assert engine.order_book.ask_volume == 25
+        assert "SELL-1" in engine.order_book
+
+        cancelled = engine.cancel_order("SELL-1")
+        assert cancelled.order_id == "SELL-1"
+        assert cancelled.quantity == 25
+        assert engine.best_ask is None
+        assert engine.order_book.ask_volume == 0
+        assert "SELL-1" not in engine.order_book
+        assert len(engine.order_book) == 0
+
+    def test_cancel_unknown_order_raises(self) -> None:
+        """Verify cancelling a non-existent or invalid order raises OrderNotFoundError or ValueError."""
+        engine = CythonMatchingEngine()
+        with pytest.raises(OrderNotFoundError):
+            engine.cancel_order("NONEXISTENT")
+
+        with pytest.raises(ValueError):
+            engine.cancel_order("")
+
+    def test_cancel_multiple_orders_sharing_price_level(self) -> None:
+        """Verify FIFO queue order preservation when cancelling an order sharing a price level."""
+        engine = CythonMatchingEngine()
+        engine.process_order(Order("B-1", OrderSide.BUY, 100.0, 10))
+        engine.process_order(Order("B-2", OrderSide.BUY, 100.0, 20))
+
+        assert engine.order_book.bid_volume == 30
+        assert engine.order_book.bids.depth() == [(100.0, 30)]
+
+        # Cancel head order B-1
+        c1 = engine.cancel_order("B-1")
+        assert c1.order_id == "B-1"
+        assert engine.order_book.bid_volume == 20
+        assert engine.best_bid == 100.0
+        assert engine.order_book.bids.best_order.order_id == "B-2"
+
+        # Cancel remaining order B-2; level should be pruned
+        c2 = engine.cancel_order("B-2")
+        assert c2.order_id == "B-2"
+        assert engine.best_bid is None
+        assert engine.order_book.bid_volume == 0
+        assert len(engine.order_book) == 0
+
+    def test_matching_cancellation_behavior_between_python_and_cython(self) -> None:
+        """Verify identical cancellation behavior between Python reference and Cython engines."""
+        py_engine = MatchingEngine()
+        cy_engine = CythonMatchingEngine()
+
+        for eng in (py_engine, cy_engine):
+            eng.process_order(Order("B1", OrderSide.BUY, 99.0, 10))
+            eng.process_order(Order("B2", OrderSide.BUY, 98.0, 15))
+            eng.process_order(Order("A1", OrderSide.SELL, 101.0, 20))
+            eng.process_order(Order("A2", OrderSide.SELL, 102.0, 25))
+
+        py_cancelled = py_engine.cancel_order("B1")
+        cy_cancelled = cy_engine.cancel_order("B1")
+
+        assert py_cancelled.order_id == cy_cancelled.order_id == "B1"
+        assert py_cancelled.quantity == cy_cancelled.quantity == 10
+        assert_engine_equality(py_engine, cy_engine)
+
+        # Cancel unknown order raises identically
+        with pytest.raises(OrderNotFoundError):
+            py_engine.cancel_order("NON_EXISTENT")
+        with pytest.raises(OrderNotFoundError):
+            cy_engine.cancel_order("NON_EXISTENT")
+
+    def test_pipeline_cancellation_with_cython_engine(self) -> None:
+        """Verify end-to-end pipeline cancellation functions with CythonMatchingEngine."""
+        pipeline = create_pipeline(engine=CythonMatchingEngine())
+        try:
+            order = Order("PIPE-BUY", OrderSide.BUY, 150.0, 50)
+            pipeline.process_order(order)
+            assert pipeline.best_bid == 150.0
+
+            cancelled = pipeline.cancel_order("PIPE-BUY")
+            assert cancelled.order_id == "PIPE-BUY"
+            assert pipeline.best_bid is None
+            assert pipeline.metrics.orders_cancelled == 1
+
+            with pytest.raises(OrderNotFoundError):
+                pipeline.cancel_order("PIPE-BUY")
+        finally:
+            pipeline.cleanup()
+
+    def test_engine_detection_through_latency_wrapper(self) -> None:
+        """Verify is_cython_accelerated returns True through LatencyInstrumentedEngine proxy."""
+        tracker = BoundedLatencyTracker()
+        cy_engine = CythonMatchingEngine()
+        wrapped_cy = LatencyInstrumentedEngine(cy_engine, tracker)
+        assert wrapped_cy.is_cython_accelerated is True
+
+        py_engine = MatchingEngine()
+        wrapped_py = LatencyInstrumentedEngine(py_engine, tracker)
+        assert wrapped_py.is_cython_accelerated is False
+
+        pipeline = create_pipeline(engine=CythonMatchingEngine())
+        runner = PipelineDashboardRunner(pipeline=pipeline, interactive=False)
+        try:
+            assert pipeline.is_cython_accelerated is True
+            assert runner.collector.source_name == "ChronosMatch-Cython"
+            snapshot = runner.collector.take_snapshot()
+            assert snapshot.is_cython_accelerated is True
+        finally:
+            runner.close()
+
+    def test_dashboard_render_shows_core_cython(self) -> None:
+        """Verify dashboard terminal rendering accurately distinguishes Cython from Python core."""
+        from chronosmatch.dashboard.terminal import DashboardRenderer
+
+        renderer = DashboardRenderer(use_colors=False)
+
+        pipeline_cy = create_pipeline(engine=CythonMatchingEngine())
+        try:
+            collector_cy = DashboardMetricsCollector(pipeline=pipeline_cy)
+            snapshot_cy = collector_cy.take_snapshot()
+            assert snapshot_cy.is_cython_accelerated is True
+            rendered_cy = renderer.render(snapshot_cy)
+            assert "Core: Cython" in rendered_cy
+            assert "Core: Python" not in rendered_cy
+        finally:
+            pipeline_cy.cleanup()
+
+        pipeline_py = create_pipeline(engine=MatchingEngine())
+        try:
+            collector_py = DashboardMetricsCollector(pipeline=pipeline_py)
+            snapshot_py = collector_py.take_snapshot()
+            assert snapshot_py.is_cython_accelerated is False
+            rendered_py = renderer.render(snapshot_py)
+            assert "Core: Python" in rendered_py
+            assert "Core: Cython" not in rendered_py
+        finally:
+            pipeline_py.cleanup()
+
+    def test_fallback_detection_remains_correct(self) -> None:
+        """Verify fallback _PyCythonMatchingEngine is not mislabeled as native Cython."""
+        tracker = BoundedLatencyTracker()
+        fallback_engine = _PyCythonMatchingEngine()
+        wrapped = LatencyInstrumentedEngine(fallback_engine, tracker)
+        assert wrapped.is_cython_accelerated is False
+
+        pipeline = create_pipeline(engine=fallback_engine)
+        try:
+            assert pipeline.is_cython_accelerated is False
+        finally:
+            pipeline.cleanup()

@@ -228,6 +228,7 @@ cdef class CythonOrderBook:
 
     cpdef object remove_order(self, str order_id):
         """Remove and return an order from the book by order_id."""
+        validate_order_id(order_id)
         if order_id not in self._order_id_to_price:
             raise OrderNotFoundError(f"Order '{order_id}' not found in the order book.")
 
@@ -250,6 +251,10 @@ cdef class CythonOrderBook:
                 self._asks.remove(price)
 
         return removed_order
+
+    cpdef object cancel_order(self, str order_id):
+        """Cancel and remove an order from the book by order_id (alias for remove_order)."""
+        return self.remove_order(order_id)
 
     cpdef object reduce_order_quantity(self, str order_id, long long filled_qty):
         """Reduce resting order quantity by filled_qty."""
@@ -464,6 +469,20 @@ cdef class CythonMatchingEngine:
     # Method aliases matching Python reference
     match_order = process_order
     match = process_order
+
+    cpdef object cancel_order(self, str order_id):
+        """Cancel and remove an order from the underlying order book.
+
+        Args:
+            order_id: Identifier of the resting order to cancel.
+
+        Returns:
+            The removed Order instance.
+
+        Raises:
+            OrderNotFoundError: If the order_id is not found in the book.
+        """
+        return self.order_book.cancel_order(order_id)
 
     @property
     def trades(self):

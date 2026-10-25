@@ -664,7 +664,18 @@ class TradingPipeline:
     @property
     def is_cython_accelerated(self) -> bool:
         """True only if compiled native Cython extension binary is actually loaded and active."""
-        return is_cython_compiled() and isinstance(self.engine, CythonMatchingEngine)
+        if not is_cython_compiled():
+            return False
+        engine = self.engine
+        if hasattr(engine, "is_cython_accelerated"):
+            return bool(engine.is_cython_accelerated)
+        while hasattr(engine, "target_engine"):
+            engine = engine.target_engine
+        from chronosmatch.cython_engine import _CompiledCythonMatchingEngine
+
+        if _CompiledCythonMatchingEngine is not None:
+            return isinstance(engine, _CompiledCythonMatchingEngine)
+        return False
 
     @property
     def is_closed(self) -> bool:
