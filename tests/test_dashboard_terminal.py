@@ -593,7 +593,7 @@ class TestNonInteractiveOutput:
             rendered = renderer.render(snapshot)
             lines = rendered.strip().split("\n")
 
-            assert len(lines) == 33
+            assert len(lines) == 40
             for line_idx, line in enumerate(lines):
                 assert len(line) == target_width, (
                     f"Line {line_idx} width is {len(line)}, expected {target_width}: '{line}'"
@@ -725,9 +725,9 @@ class TestInPlaceRenderingAndNonInteractiveOutput:
         # First frame starts without prefix
         assert not out1.startswith("\033[")
         lines_count = len(out1.splitlines())
-        assert lines_count == 33
+        assert lines_count == 40
 
-        # Second frame MUST rewind cursor up by 33 lines and clear down (\r\033[33A\033[J)
+        # Second frame MUST rewind cursor up by 40 lines and clear down (\r\033[40A\033[J)
         stream.seek(0)
         stream.truncate(0)
         snap2 = collector.take_snapshot()

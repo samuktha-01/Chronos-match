@@ -291,6 +291,9 @@ class DashboardMetricsSnapshot:
     best_bid: float | int | Decimal | None
     best_ask: float | int | Decimal | None
     spread: float | int | Decimal | None
+    core_latency: LatencyStats | None = None
+    queue_dwell_latency: LatencyStats | None = None
+    tick_to_trade_latency: LatencyStats | None = None
     order_book_depth_levels: int | None = None
     is_cython_accelerated: bool = False
     source_name: str = "ChronosMatch"
@@ -319,6 +322,13 @@ class DashboardMetricsSnapshot:
             "processing_errors": self.processing_errors,
             "backpressure_events": self.backpressure_events,
             "latency": self.latency.to_dict() if self.latency is not None else None,
+            "core_latency": self.core_latency.to_dict() if self.core_latency is not None else None,
+            "queue_dwell_latency": (
+                self.queue_dwell_latency.to_dict() if self.queue_dwell_latency is not None else None
+            ),
+            "tick_to_trade_latency": (
+                self.tick_to_trade_latency.to_dict() if self.tick_to_trade_latency is not None else None
+            ),
             "best_bid": float(self.best_bid) if self.best_bid is not None else None,
             "best_ask": float(self.best_ask) if self.best_ask is not None else None,
             "spread": float(self.spread) if self.spread is not None else None,
@@ -355,6 +365,9 @@ class DashboardMetricsCollector:
         ring_buffer: Any = None,
         simulator: Any = None,
         latency_tracker: BoundedLatencyTracker | None = None,
+        core_latency_tracker: BoundedLatencyTracker | None = None,
+        dwell_latency_tracker: BoundedLatencyTracker | None = None,
+        tick_to_trade_tracker: BoundedLatencyTracker | None = None,
         source_name: str = "ChronosMatch",
     ) -> None:
         """Initialize DashboardMetricsCollector.
@@ -364,7 +377,10 @@ class DashboardMetricsCollector:
             engine: Optional MatchingEngine or CythonMatchingEngine instance to adapt.
             ring_buffer: Optional RingBuffer instance to adapt.
             simulator: Optional MarketSimulator instance to adapt.
-            latency_tracker: Optional BoundedLatencyTracker instance (creates default if None).
+            latency_tracker: Optional BoundedLatencyTracker instance (legacy alias for core latency).
+            core_latency_tracker: Optional BoundedLatencyTracker for core matching latency (T3 - T2).
+            dwell_latency_tracker: Optional BoundedLatencyTracker for ring-buffer queue dwell latency (T2 - T1).
+            tick_to_trade_tracker: Optional BoundedLatencyTracker for end-to-end tick-to-trade latency (T3 - T0).
             source_name: Descriptive name for diagnostic reporting.
         """
         self.source_name = source_name
@@ -372,9 +388,21 @@ class DashboardMetricsCollector:
         self._engine = engine
         self._ring_buffer = ring_buffer
         self._simulator = simulator
-        self._latency_tracker: BoundedLatencyTracker = (
-            latency_tracker if latency_tracker is not None else BoundedLatencyTracker()
+
+        # Bounded reservoirs for distinct latency categories
+        self._core_latency_tracker: BoundedLatencyTracker = (
+            core_latency_tracker
+            if core_latency_tracker is not None
+            else (latency_tracker if latency_tracker is not None else BoundedLatencyTracker())
         )
+        self._dwell_latency_tracker: BoundedLatencyTracker = (
+            dwell_latency_tracker if dwell_latency_tracker is not None else BoundedLatencyTracker()
+        )
+        self._tick_to_trade_tracker: BoundedLatencyTracker = (
+            tick_to_trade_tracker if tick_to_trade_tracker is not None else BoundedLatencyTracker()
+        )
+        # Backward compatibility alias
+        self._latency_tracker: BoundedLatencyTracker = self._core_latency_tracker
 
         # Monotonic execution timer tracking
         self._start_time_ns: int | None = None
@@ -418,6 +446,13 @@ class DashboardMetricsCollector:
                 self._ring_buffer = pipeline.ring_buffer
             if hasattr(pipeline, "simulator") and pipeline.simulator is not None:
                 self._simulator = pipeline.simulator
+            if hasattr(pipeline, "core_latency_tracker") and pipeline.core_latency_tracker is not None:
+                self._core_latency_tracker = pipeline.core_latency_tracker
+                self._latency_tracker = self._core_latency_tracker
+            if hasattr(pipeline, "dwell_latency_tracker") and pipeline.dwell_latency_tracker is not None:
+                self._dwell_latency_tracker = pipeline.dwell_latency_tracker
+            if hasattr(pipeline, "tick_to_trade_tracker") and pipeline.tick_to_trade_tracker is not None:
+                self._tick_to_trade_tracker = pipeline.tick_to_trade_tracker
 
     def attach_engine(self, engine: Any) -> None:
         """Attach a MatchingEngine instance to monitor trades and order book."""
@@ -462,12 +497,24 @@ class DashboardMetricsCollector:
     # --------------------------------------------------------------------------
 
     def record_latency(self, latency_ns: float | int) -> None:
-        """Record an order processing latency sample in nanoseconds."""
-        self._latency_tracker.record_latency(latency_ns)
+        """Record an order processing latency sample in nanoseconds (alias for core latency)."""
+        self._core_latency_tracker.record_latency(latency_ns)
+
+    def record_core_latency(self, latency_ns: float | int) -> None:
+        """Record a core matching latency sample (T3 - T2) in nanoseconds."""
+        self._core_latency_tracker.record_latency(latency_ns)
+
+    def record_dwell_latency(self, latency_ns: float | int) -> None:
+        """Record a ring-buffer queue dwell latency sample (T2 - T1) in nanoseconds."""
+        self._dwell_latency_tracker.record_latency(latency_ns)
+
+    def record_tick_to_trade_latency(self, latency_ns: float | int) -> None:
+        """Record an end-to-end tick-to-trade latency sample (T3 - T0) in nanoseconds."""
+        self._tick_to_trade_tracker.record_latency(latency_ns)
 
     def record_duration(self, start_ns: int, end_ns: int | None = None) -> float:
         """Calculate and record duration from start_ns to end_ns."""
-        return self._latency_tracker.record_duration(start_ns, end_ns)
+        return self._core_latency_tracker.record_duration(start_ns, end_ns)
 
     def record_order_generated(self, count: int = 1) -> None:
         """Increment manual count of generated orders."""
@@ -557,10 +604,18 @@ class DashboardMetricsCollector:
             # 6. Market Depth & Prices
             best_bid, best_ask, spread, depth_levels = self._resolve_market_state()
 
-            # 7. Latency Telemetry
-            lat_stats = self._latency_tracker.get_stats()
-            has_latency = lat_stats.sample_count > 0
-            latency_result = lat_stats if has_latency else None
+            # 7. Latency Telemetry (Core, Queue Dwell & Tick-to-Trade)
+            core_stats = self._core_latency_tracker.get_stats()
+            core_result = core_stats if core_stats.sample_count > 0 else None
+
+            dwell_stats = self._dwell_latency_tracker.get_stats()
+            dwell_result = dwell_stats if dwell_stats.sample_count > 0 else None
+
+            ttt_stats = self._tick_to_trade_tracker.get_stats()
+            ttt_result = ttt_stats if ttt_stats.sample_count > 0 else None
+
+            # Backward-compatible alias pointing to core matching latency
+            latency_result = core_result
 
             # 8. Throughput Calculations
             throughput = self._compute_cumulative_throughput(proc_orders, elapsed_sec)
@@ -603,6 +658,9 @@ class DashboardMetricsCollector:
                 processing_errors=proc_errors,
                 backpressure_events=backpressure,
                 latency=latency_result,
+                core_latency=core_result,
+                queue_dwell_latency=dwell_result,
+                tick_to_trade_latency=ttt_result,
                 best_bid=best_bid,
                 best_ask=best_ask,
                 spread=spread,
@@ -862,6 +920,21 @@ class DashboardMetricsCollector:
         return best_bid, best_ask, spread, depth_levels
 
     @property
+    def core_latency_tracker(self) -> BoundedLatencyTracker:
+        """The underlying BoundedLatencyTracker for core matching latency (T3 - T2)."""
+        return self._core_latency_tracker
+
+    @property
+    def dwell_latency_tracker(self) -> BoundedLatencyTracker:
+        """The underlying BoundedLatencyTracker for ring-buffer queue dwell latency (T2 - T1)."""
+        return self._dwell_latency_tracker
+
+    @property
+    def tick_to_trade_tracker(self) -> BoundedLatencyTracker:
+        """The underlying BoundedLatencyTracker for end-to-end tick-to-trade latency (T3 - T0)."""
+        return self._tick_to_trade_tracker
+
+    @property
     def latency_tracker(self) -> BoundedLatencyTracker:
-        """The underlying BoundedLatencyTracker instance."""
-        return self._latency_tracker
+        """The underlying BoundedLatencyTracker instance (alias for core_latency_tracker)."""
+        return self._core_latency_tracker

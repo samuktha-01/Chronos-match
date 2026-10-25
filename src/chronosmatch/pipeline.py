@@ -14,7 +14,7 @@ from decimal import Decimal
 import math
 from pathlib import Path
 import time
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Callable, Self
 
 from chronosmatch.binary_protocol import (
     ORDER_STRUCT_SIZE,
@@ -25,6 +25,12 @@ from chronosmatch.cython_engine import (
     CythonMatchingEngine,
     is_cython_compiled,
 )
+
+if TYPE_CHECKING:
+    from chronosmatch.dashboard.metrics import (
+        BoundedLatencyTracker,
+        LatencyStats,
+    )
 from chronosmatch.market_simulator import (
     BackpressureMode,
     BackpressureTimeoutError,
@@ -78,6 +84,10 @@ class TradingPipelineMetrics:
     stop_time_ns: int | None = None
     wall_start_time_ns: int | None = None
     wall_stop_time_ns: int | None = None
+    core_latency: LatencyStats | None = None
+    queue_dwell_latency: LatencyStats | None = None
+    tick_to_trade_latency: LatencyStats | None = None
+    latency: LatencyStats | None = None
 
     @property
     def elapsed_seconds(self) -> float:
@@ -113,6 +123,14 @@ class TradingPipelineMetrics:
             "throughput_orders_per_sec": self.throughput_orders_per_sec,
             "start_time_ns": self.start_time_ns,
             "stop_time_ns": self.stop_time_ns,
+            "core_latency": self.core_latency.to_dict() if self.core_latency is not None else None,
+            "queue_dwell_latency": (
+                self.queue_dwell_latency.to_dict() if self.queue_dwell_latency is not None else None
+            ),
+            "tick_to_trade_latency": (
+                self.tick_to_trade_latency.to_dict() if self.tick_to_trade_latency is not None else None
+            ),
+            "latency": self.latency.to_dict() if self.latency is not None else None,
         }
 
     def reset(self) -> None:
@@ -132,6 +150,10 @@ class TradingPipelineMetrics:
         self.stop_time_ns = None
         self.wall_start_time_ns = None
         self.wall_stop_time_ns = None
+        self.core_latency = None
+        self.queue_dwell_latency = None
+        self.tick_to_trade_latency = None
+        self.latency = None
 
 
 # ==============================================================================
@@ -164,6 +186,8 @@ class TradingPipeline:
         durability_policy: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
         recover_trades: bool = False,
         strict_recovery: bool = False,
+        instrument_latency: bool = False,
+        latency_callback: Callable[[float | None, float | None, float | None], None] | None = None,
     ) -> None:
         """Initialize the end-to-end trading pipeline.
 
@@ -179,11 +203,28 @@ class TradingPipeline:
             durability_policy: Durability guarantee for disk writes.
             recover_trades: If True, recovers historical trades into the engine.
             strict_recovery: If True, raises PersistenceError on recovery errors.
+            instrument_latency: If True, instruments core, queue dwell, and tick-to-trade latency.
+            latency_callback: Optional callable invoked with (core_ns, dwell_ns, ttt_ns) per order.
         """
         self.config: MarketFeedConfig = config if config is not None else MarketFeedConfig()
         self.metrics: TradingPipelineMetrics = TradingPipelineMetrics()
         self.engine: Any = engine if engine is not None else MatchingEngine()
         self._durability_policy = DurabilityPolicy(durability_policy)
+
+        # Latency instrumentation state
+        self._instrument_latency: bool = instrument_latency
+        self.latency_callback: Callable[[float | None, float | None, float | None], None] | None = latency_callback
+        if instrument_latency:
+            from chronosmatch.dashboard.metrics import BoundedLatencyTracker
+
+            self._core_latency_tracker: BoundedLatencyTracker | None = BoundedLatencyTracker()
+            self._dwell_latency_tracker: BoundedLatencyTracker | None = BoundedLatencyTracker()
+            self._tick_to_trade_tracker: BoundedLatencyTracker | None = BoundedLatencyTracker()
+        else:
+            self._core_latency_tracker = None
+            self._dwell_latency_tracker = None
+            self._tick_to_trade_tracker = None
+        self._pending_published: dict[str, tuple[int | None, int]] = {}
 
         # Persistence setup
         self._owns_wal: bool = False
@@ -223,6 +264,88 @@ class TradingPipeline:
             self.recover_trade_history(strict=strict_recovery)
 
     # --------------------------------------------------------------------------
+    # Latency Telemetry Tracking
+    # --------------------------------------------------------------------------
+
+    def _emit_latency(
+        self,
+        t0: int | None,
+        t1: int | None,
+        t2: int | None,
+        t3: int | None,
+    ) -> None:
+        """Calculate and record core, queue dwell, and tick-to-trade latency distributions.
+
+        Measurement boundaries:
+        - T0: Order generation time (nanoseconds).
+        - T1: Successful publication to the ring buffer (time.perf_counter_ns()).
+        - T2: Consumer begins matching-engine processing (time.perf_counter_ns()).
+        - T3: Matching-engine processing completes (time.perf_counter_ns()).
+
+        Calculations:
+        - Core matching latency = T3 - T2.
+        - Queue dwell latency = T2 - T1.
+        - Tick-to-trade latency = T3 - T0.
+        """
+        if not self._instrument_latency:
+            return
+
+        # 1. Core Matching Latency = T3 - T2
+        core_ns: float | None = None
+        if t2 is not None and t3 is not None and t3 >= t2:
+            core_ns = float(t3 - t2)
+            # Record into core tracker only if engine isn't already directly self-instrumented (e.g. LatencyInstrumentedEngine)
+            if self._core_latency_tracker is not None and not hasattr(self.engine, "target_engine"):
+                self._core_latency_tracker.record_latency(core_ns)
+
+        # 2. Queue Dwell Latency = T2 - T1
+        dwell_ns: float | None = None
+        if t1 is not None and t2 is not None and t2 >= t1:
+            dwell_ns = float(t2 - t1)
+            if self._dwell_latency_tracker is not None:
+                self._dwell_latency_tracker.record_latency(dwell_ns)
+
+        # 3. Tick-to-Trade Latency = T3 - T0
+        ttt_ns: float | None = None
+        if t0 is not None and t0 > 0 and t3 is not None:
+            delta = t3 - t0
+            if 0 <= delta <= 300_000_000_000:
+                ttt_ns = float(delta)
+            elif t0 > 1_500_000_000_000_000_000:
+                wall_delta = time.time_ns() - t0
+                if 0 <= wall_delta <= 300_000_000_000:
+                    ttt_ns = float(wall_delta)
+
+            if ttt_ns is not None and self._tick_to_trade_tracker is not None:
+                self._tick_to_trade_tracker.record_latency(ttt_ns)
+
+        if self.latency_callback is not None:
+            try:
+                self.latency_callback(core_ns, dwell_ns, ttt_ns)
+            except Exception:
+                pass
+
+    @property
+    def core_latency_tracker(self) -> BoundedLatencyTracker | None:
+        """Bounded latency tracker for core matching latency (T3 - T2)."""
+        return self._core_latency_tracker
+
+    @property
+    def dwell_latency_tracker(self) -> BoundedLatencyTracker | None:
+        """Bounded latency tracker for ring-buffer queue dwell latency (T2 - T1)."""
+        return self._dwell_latency_tracker
+
+    @property
+    def tick_to_trade_tracker(self) -> BoundedLatencyTracker | None:
+        """Bounded latency tracker for end-to-end tick-to-trade latency (T3 - T0)."""
+        return self._tick_to_trade_tracker
+
+    @property
+    def latency_tracker(self) -> BoundedLatencyTracker | None:
+        """Bounded latency tracker (alias for core_latency_tracker)."""
+        return self._core_latency_tracker
+
+    # --------------------------------------------------------------------------
     # Deterministic Single-Step & Manual Ingestion
     # --------------------------------------------------------------------------
 
@@ -243,10 +366,13 @@ class TradingPipeline:
             RingBufferClosedError: If ring buffer is closed.
         """
         self._check_closed()
+        t0 = getattr(order, "timestamp", None)
         self._producer.publish_nowait(order)
+        t1 = time.perf_counter_ns()
         self.metrics.orders_published += 1
 
         consumed_order = self._consumer.get_nowait()
+        t2 = time.perf_counter_ns()
         self.metrics.orders_consumed += 1
         self.metrics.orders_processed += 1
 
@@ -255,7 +381,13 @@ class TradingPipeline:
 
         trades: list[Trade] = []
         try:
+            try:
+                consumed_order._chronos_timed = True
+            except AttributeError:
+                pass
             trades = self.engine.process_order(consumed_order)
+            t3 = time.perf_counter_ns()
+            self._emit_latency(t0=t0, t1=t1, t2=t2, t3=t3)
             self.metrics.trades_executed += len(trades)
             self.metrics.volume_executed += sum(t.quantity for t in trades)
             if self._wal is not None and trades:
@@ -356,6 +488,7 @@ class TradingPipeline:
 
             try:
                 order = self._consumer.get_nowait()
+                t2 = time.perf_counter_ns()
             except (MalformedRecordError, SharedMemoryError, ValueError, TypeError):
                 # Malformed binary record detected in buffer slot
                 self.metrics.orders_consumed += 1
@@ -363,6 +496,9 @@ class TradingPipeline:
                 continue
             except RingBufferEmptyError:
                 break
+
+            ts_info = self._pending_published.pop(order.order_id, None) if self._instrument_latency else None
+            t0, t1 = ts_info if ts_info is not None else (getattr(order, "timestamp", None), None)
 
             self.metrics.orders_consumed += 1
 
@@ -373,7 +509,13 @@ class TradingPipeline:
             processed += 1
 
             try:
+                try:
+                    order._chronos_timed = True
+                except AttributeError:
+                    pass
                 trades = self.engine.process_order(order)
+                t3 = time.perf_counter_ns()
+                self._emit_latency(t0=t0, t1=t1, t2=t2, t3=t3)
                 self.metrics.trades_executed += len(trades)
                 self.metrics.volume_executed += sum(t.quantity for t in trades)
                 if self._wal is not None and trades:
@@ -432,6 +574,7 @@ class TradingPipeline:
                 if not self._consumer.is_empty:
                     try:
                         order = self._consumer.get_nowait()
+                        t2 = time.perf_counter_ns()
                     except (MalformedRecordError, SharedMemoryError, ValueError, TypeError):
                         self.metrics.orders_consumed += 1
                         self.metrics.malformed_messages += 1
@@ -439,6 +582,9 @@ class TradingPipeline:
                     except RingBufferEmptyError:
                         await asyncio.sleep(0.0005)
                         continue
+
+                    ts_info = self._pending_published.pop(order.order_id, None) if self._instrument_latency else None
+                    t0, t1 = ts_info if ts_info is not None else (getattr(order, "timestamp", None), None)
 
                     self.metrics.orders_consumed += 1
 
@@ -449,7 +595,13 @@ class TradingPipeline:
                     processed += 1
 
                     try:
+                        try:
+                            order._chronos_timed = True
+                        except AttributeError:
+                            pass
                         trades = self.engine.process_order(order)
+                        t3 = time.perf_counter_ns()
+                        self._emit_latency(t0=t0, t1=t1, t2=t2, t3=t3)
                         self.metrics.trades_executed += len(trades)
                         self.metrics.volume_executed += sum(t.quantity for t in trades)
                         if self._wal is not None and trades:
@@ -504,6 +656,14 @@ class TradingPipeline:
 
         def on_publish(ord: Order) -> None:
             self.metrics.orders_published += 1
+            if self._instrument_latency:
+                t1 = time.perf_counter_ns()
+                if len(self._pending_published) > self._ring_buffer.capacity * 4:
+                    try:
+                        self._pending_published.pop(next(iter(self._pending_published)))
+                    except Exception:
+                        pass
+                self._pending_published[ord.order_id] = (getattr(ord, "timestamp", None), t1)
 
         async def _producer_loop() -> None:
             try:
@@ -532,6 +692,20 @@ class TradingPipeline:
             if self.metrics.start_time_ns is not None and stop_ns <= self.metrics.start_time_ns:
                 stop_ns = self.metrics.start_time_ns + 1
             self.metrics.stop_time_ns = stop_ns
+
+            if self._core_latency_tracker is not None:
+                core_stats = self._core_latency_tracker.get_stats()
+                if core_stats.sample_count > 0:
+                    self.metrics.core_latency = core_stats
+                    self.metrics.latency = core_stats
+            if self._dwell_latency_tracker is not None:
+                dwell_stats = self._dwell_latency_tracker.get_stats()
+                if dwell_stats.sample_count > 0:
+                    self.metrics.queue_dwell_latency = dwell_stats
+            if self._tick_to_trade_tracker is not None:
+                ttt_stats = self._tick_to_trade_tracker.get_stats()
+                if ttt_stats.sample_count > 0:
+                    self.metrics.tick_to_trade_latency = ttt_stats
 
         return self.metrics
 
@@ -782,6 +956,8 @@ def create_pipeline(
     wal: WriteAheadLog | None = None,
     trade_store: TradeStore | None = None,
     durability_policy: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
+    instrument_latency: bool = False,
+    latency_callback: Callable[[float | None, float | None, float | None], None] | None = None,
 ) -> TradingPipeline:
     """Convenience factory function to instantiate a TradingPipeline."""
     return TradingPipeline(
@@ -793,4 +969,6 @@ def create_pipeline(
         wal=wal,
         trade_store=trade_store,
         durability_policy=durability_policy,
+        instrument_latency=instrument_latency,
+        latency_callback=latency_callback,
     )

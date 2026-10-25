@@ -610,50 +610,55 @@ class DashboardRenderer:
         lines.append(self._pad_row(f"  Utilization:        {util_gauge}"))
 
         # ----------------------------------------------------------------------
-        # 5. Order-to-Trade Latency Distribution
+        # 5. Latency Telemetry & Breakdown
         # ----------------------------------------------------------------------
         lines.append(self._divider())
-        lat = snapshot.latency
-        has_latency_samples = lat is not None and lat.sample_count > 0
+        core_lat = snapshot.core_latency
+        dwell_lat = snapshot.queue_dwell_latency
+        ttt_lat = snapshot.tick_to_trade_latency
 
-        if has_latency_samples and lat is not None:
-            extra_sample_tag = styler.dim(f"({lat.sample_count:,} Samples)") if styler.enabled else f"({lat.sample_count:,} Samples)"
-            lines.append(self._section_header("ORDER-TO-TRADE LATENCY DISTRIBUTION", extra_sample_tag))
+        has_latency_samples = core_lat is not None and core_lat.sample_count > 0
+
+        if has_latency_samples and core_lat is not None:
+            extra_sample_tag = styler.dim(f"({core_lat.sample_count:,} Samples)") if styler.enabled else f"({core_lat.sample_count:,} Samples)"
+            lines.append(self._section_header("LATENCY TELEMETRY & BREAKDOWN", extra_sample_tag))
+            lines.append(self._pad_row(f"  {styler.bold('Core Matching Latency (T3 - T2):') if styler.enabled else 'Core Matching Latency (T3 - T2):'}"))
             lines.append(
                 self._two_col_row(
                     "p50 (Median)",
-                    format_latency(lat.p50_us, styler, box.micro),
+                    format_latency(core_lat.p50_us, styler, box.micro),
                     "Min Latency",
-                    format_latency(lat.min_us, styler, box.micro),
+                    format_latency(core_lat.min_us, styler, box.micro),
                 )
             )
             lines.append(
                 self._two_col_row(
                     "p95",
-                    format_latency(lat.p95_us, styler, box.micro),
+                    format_latency(core_lat.p95_us, styler, box.micro),
                     "Mean Latency",
-                    format_latency(lat.mean_us, styler, box.micro),
+                    format_latency(core_lat.mean_us, styler, box.micro),
                 )
             )
             lines.append(
                 self._two_col_row(
                     "p99",
-                    format_latency(lat.p99_us, styler, box.micro),
+                    format_latency(core_lat.p99_us, styler, box.micro),
                     "Max Latency",
-                    format_latency(lat.max_us, styler, box.micro),
+                    format_latency(core_lat.max_us, styler, box.micro),
                 )
             )
             lines.append(
                 self._two_col_row(
                     "p99.9",
-                    format_latency(lat.p99_9_us, styler, box.micro),
+                    format_latency(core_lat.p99_9_us, styler, box.micro),
                     "Latest Sample",
-                    format_latency(lat.latest_us, styler, box.micro),
+                    format_latency(core_lat.latest_us, styler, box.micro),
                 )
             )
         else:
             no_samples_tag = styler.dim("(No Samples)") if styler.enabled else "(No Samples)"
-            lines.append(self._section_header("ORDER-TO-TRADE LATENCY DISTRIBUTION", no_samples_tag))
+            lines.append(self._section_header("LATENCY TELEMETRY & BREAKDOWN", no_samples_tag))
+            lines.append(self._pad_row(f"  {styler.bold('Core Matching Latency (T3 - T2):') if styler.enabled else 'Core Matching Latency (T3 - T2):'}"))
             lines.append(
                 self._two_col_row(
                     "p50 (Median)",
@@ -683,6 +688,94 @@ class DashboardRenderer:
                     "p99.9",
                     styler.gray("N/A"),
                     "Latest Sample",
+                    styler.gray("N/A"),
+                )
+            )
+
+        # Queue Dwell Latency (T2 - T1)
+        dwell_tag = (
+            f"({dwell_lat.sample_count:,} Samples)"
+            if (dwell_lat is not None and dwell_lat.sample_count > 0)
+            else "(No Samples)"
+        )
+        if styler.enabled:
+            dwell_tag = styler.dim(dwell_tag)
+        lines.append(self._pad_row(f"  {styler.bold('Queue Dwell Latency (T2 - T1):') if styler.enabled else 'Queue Dwell Latency (T2 - T1):'}  {dwell_tag}"))
+        if dwell_lat is not None and dwell_lat.sample_count > 0:
+            lines.append(
+                self._two_col_row(
+                    "Dwell p50",
+                    format_latency(dwell_lat.p50_us, styler, box.micro),
+                    "Dwell Mean",
+                    format_latency(dwell_lat.mean_us, styler, box.micro),
+                )
+            )
+            lines.append(
+                self._two_col_row(
+                    "Dwell p95",
+                    format_latency(dwell_lat.p95_us, styler, box.micro),
+                    "Dwell p99",
+                    format_latency(dwell_lat.p99_us, styler, box.micro),
+                )
+            )
+        else:
+            lines.append(
+                self._two_col_row(
+                    "Dwell p50",
+                    styler.gray("N/A"),
+                    "Dwell Mean",
+                    styler.gray("N/A"),
+                )
+            )
+            lines.append(
+                self._two_col_row(
+                    "Dwell p95",
+                    styler.gray("N/A"),
+                    "Dwell p99",
+                    styler.gray("N/A"),
+                )
+            )
+
+        # End-to-End Tick-to-Trade Latency (T3 - T0)
+        ttt_tag = (
+            f"({ttt_lat.sample_count:,} Samples)"
+            if (ttt_lat is not None and ttt_lat.sample_count > 0)
+            else "(No Samples)"
+        )
+        if styler.enabled:
+            ttt_tag = styler.dim(ttt_tag)
+        lines.append(self._pad_row(f"  {styler.bold('Tick-to-Trade Latency (T3 - T0):') if styler.enabled else 'Tick-to-Trade Latency (T3 - T0):'}  {ttt_tag}"))
+        if ttt_lat is not None and ttt_lat.sample_count > 0:
+            lines.append(
+                self._two_col_row(
+                    "Tick-to-Trade p50",
+                    format_latency(ttt_lat.p50_us, styler, box.micro),
+                    "Tick-to-Trade Mean",
+                    format_latency(ttt_lat.mean_us, styler, box.micro),
+                )
+            )
+            lines.append(
+                self._two_col_row(
+                    "Tick-to-Trade p95",
+                    format_latency(ttt_lat.p95_us, styler, box.micro),
+                    "Tick-to-Trade p99",
+                    format_latency(ttt_lat.p99_us, styler, box.micro),
+                )
+            )
+        else:
+            lines.append(
+                self._two_col_row(
+                    "Tick-to-Trade p50",
+                    styler.gray("N/A"),
+                    "Tick-to-Trade Mean",
+                    styler.gray("N/A"),
+                )
+            )
+            lines.append(
+                self._two_col_row(
+                    "Tick-to-Trade p95",
+                    styler.gray("N/A"),
+                    "Tick-to-Trade p99",
                     styler.gray("N/A"),
                 )
             )

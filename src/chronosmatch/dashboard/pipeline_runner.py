@@ -165,21 +165,41 @@ class PipelineDashboardRunner:
             use_unicode: If True, uses Unicode box drawing; if None, auto-detects from stream.
             width: Column width of dashboard box.
             output: Destination output stream (defaults to sys.stdout).
-            instrument_latency: If True, wraps matching engine with LatencyInstrumentedEngine.
+            instrument_latency: If True, enables latency instrumentation.
             source_name: Descriptive name for reporting (defaults to engine mode name).
         """
         self._owns_pipeline: bool = pipeline is None
         self._pipeline: TradingPipeline = pipeline if pipeline is not None else create_pipeline()
 
-        self._latency_tracker = BoundedLatencyTracker()
         self._instrument_latency = instrument_latency
 
         if self._instrument_latency:
-            # Wrap engine with nanosecond latency instrumentation
-            self._pipeline.engine = LatencyInstrumentedEngine(
-                self._pipeline.engine,
-                self._latency_tracker,
-            )
+            self._pipeline._instrument_latency = True
+            if getattr(self._pipeline, "_core_latency_tracker", None) is None:
+                self._pipeline._core_latency_tracker = BoundedLatencyTracker()
+            if getattr(self._pipeline, "_dwell_latency_tracker", None) is None:
+                self._pipeline._dwell_latency_tracker = BoundedLatencyTracker()
+            if getattr(self._pipeline, "_tick_to_trade_tracker", None) is None:
+                self._pipeline._tick_to_trade_tracker = BoundedLatencyTracker()
+
+            self._core_latency_tracker = self._pipeline._core_latency_tracker
+            self._dwell_latency_tracker = self._pipeline._dwell_latency_tracker
+            self._tick_to_trade_tracker = self._pipeline._tick_to_trade_tracker
+            self._latency_tracker = self._core_latency_tracker
+
+            # Wrap engine with nanosecond latency instrumentation if not already wrapped
+            if not isinstance(self._pipeline.engine, LatencyInstrumentedEngine):
+                self._pipeline.engine = LatencyInstrumentedEngine(
+                    self._pipeline.engine,
+                    self._core_latency_tracker,
+                )
+        else:
+            if hasattr(self._pipeline, "_instrument_latency"):
+                self._pipeline._instrument_latency = False
+            self._core_latency_tracker = BoundedLatencyTracker()
+            self._dwell_latency_tracker = BoundedLatencyTracker()
+            self._tick_to_trade_tracker = BoundedLatencyTracker()
+            self._latency_tracker = self._core_latency_tracker
 
         resolved_source = (
             source_name
@@ -189,7 +209,9 @@ class PipelineDashboardRunner:
 
         self._collector = DashboardMetricsCollector(
             pipeline=self._pipeline,
-            latency_tracker=self._latency_tracker,
+            latency_tracker=self._core_latency_tracker,
+            dwell_latency_tracker=self._dwell_latency_tracker,
+            tick_to_trade_tracker=self._tick_to_trade_tracker,
             source_name=resolved_source,
         )
 
@@ -220,8 +242,23 @@ class PipelineDashboardRunner:
 
     @property
     def latency_tracker(self) -> BoundedLatencyTracker:
-        """Underlying BoundedLatencyTracker instance."""
+        """Underlying core latency tracker instance (backward compatibility alias)."""
         return self._latency_tracker
+
+    @property
+    def core_latency_tracker(self) -> BoundedLatencyTracker:
+        """Underlying core matching latency tracker instance."""
+        return self._core_latency_tracker
+
+    @property
+    def dwell_latency_tracker(self) -> BoundedLatencyTracker:
+        """Underlying queue dwell latency tracker instance."""
+        return self._dwell_latency_tracker
+
+    @property
+    def tick_to_trade_tracker(self) -> BoundedLatencyTracker:
+        """Underlying tick-to-trade latency tracker instance."""
+        return self._tick_to_trade_tracker
 
     # --------------------------------------------------------------------------
     # Execution Modes

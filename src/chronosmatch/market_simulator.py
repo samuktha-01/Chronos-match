@@ -575,7 +575,7 @@ class MarketSimulator:
             side=side,
             price=price,
             quantity=quantity,
-            timestamp=time.time_ns(),
+            timestamp=time.perf_counter_ns(),
             sequence_number=self._sequence_number,
         )
 
