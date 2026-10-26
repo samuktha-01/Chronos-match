@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 import math
+import mmap
 import struct
 import time
 from typing import Any
@@ -301,16 +302,16 @@ def _validate_sequence_number(sequence_number: Any) -> tuple[int, int]:
     return 1, sequence_number
 
 
-def encode_order(order: Order) -> bytes:
-    """Encode an Order instance into a fixed 64-byte binary sequence.
-
-    Uses Little-Endian format '<Q32sqIBBBBQ' conforming to single CPU cache-line alignment.
+def _validate_order_fields(
+    order: Order,
+) -> tuple[int, bytes, int, int, int, int, int, int, int]:
+    """Validate all Order fields and return the packed tuple elements.
 
     Args:
         order: Valid Order instance to serialize.
 
     Returns:
-        Exactly 64 bytes of packed binary data.
+        Tuple of (ts, raw_id, price_ticks, qty, side_code, price_type, has_seq, flags, seq_num).
 
     Raises:
         TypeError: If order is not an Order instance or has invalid field types.
@@ -327,7 +328,7 @@ def encode_order(order: Order) -> bytes:
     has_seq, seq_num = _validate_sequence_number(order.sequence_number)
     flags = 0
 
-    return ORDER_STRUCT.pack(
+    return (
         ts,
         raw_id,
         price_ticks,
@@ -340,38 +341,36 @@ def encode_order(order: Order) -> bytes:
     )
 
 
-def decode_order(data: bytes | bytearray | memoryview) -> Order:
-    """Decode a 64-byte binary order sequence back into an Order instance.
+def _reconstruct_order(
+    ts: int,
+    raw_id: bytes,
+    price_ticks: int,
+    qty: int,
+    side_code: int,
+    price_type: int,
+    has_seq: int,
+    flags: int,
+    seq_num: int,
+) -> Order:
+    """Validate unpacked fields and reconstruct an Order instance.
 
     Args:
-        data: Exactly 64 bytes of binary order data.
+        ts: Nanosecond timestamp.
+        raw_id: Fixed 32-byte order ID field.
+        price_ticks: Integer scaled price.
+        qty: Integer quantity.
+        side_code: Numeric side indicator (1 = BUY, 2 = SELL).
+        price_type: Type indicator code (float, int, or Decimal).
+        has_seq: Sequence number presence flag (0 = None, 1 = present).
+        flags: Reserved flags byte.
+        seq_num: Unsigned 64-bit sequence number.
 
     Returns:
-        Reconstructed Order instance with original fields and types preserved.
+        Reconstructed Order instance.
 
     Raises:
-        TypeError: If data is not bytes-like.
-        ValueError: If data length is not 64 bytes or any field value is invalid/malformed.
+        ValueError: If any unpacked field value is out of allowable range or malformed.
     """
-    if not isinstance(data, (bytes, bytearray, memoryview)):
-        raise TypeError(f"Expected bytes-like object, got {type(data).__name__}")
-    if len(data) != ORDER_STRUCT_SIZE:
-        raise ValueError(
-            f"Expected binary order data of length {ORDER_STRUCT_SIZE} bytes, got {len(data)} bytes"
-        )
-
-    (
-        ts,
-        raw_id,
-        price_ticks,
-        qty,
-        side_code,
-        price_type,
-        has_seq,
-        flags,
-        seq_num,
-    ) = ORDER_STRUCT.unpack(data)
-
     if ts <= 0:
         raise ValueError(f"Decoded timestamp must be strictly positive (> 0), got {ts}")
 
@@ -399,51 +398,146 @@ def decode_order(data: bytes | bytearray | memoryview) -> Order:
     )
 
 
-def encode_order_into(order: Order, buffer: bytearray | memoryview, offset: int = 0) -> None:
-    """Encode an Order directly into an existing buffer at the given offset.
+def encode_order(order: Order) -> bytes:
+    """Encode an Order instance into a fixed 64-byte binary sequence.
 
-    Facilitates zero-copy shared-memory ring buffer writes.
+    Uses Little-Endian format '<Q32sqIBBBBQ' conforming to single CPU cache-line alignment.
+
+    Args:
+        order: Valid Order instance to serialize.
+
+    Returns:
+        Exactly 64 bytes of packed binary data.
+
+    Raises:
+        TypeError: If order is not an Order instance or has invalid field types.
+        ValueError: If any field values are out of allowable range or cannot be represented.
+    """
+    fields = _validate_order_fields(order)
+    return ORDER_STRUCT.pack(*fields)
+
+
+def encode_order_into(
+    order: Order,
+    buffer: bytearray | memoryview | mmap.mmap | Any,
+    offset: int = 0,
+) -> None:
+    """Encode an Order directly into an existing writable buffer at the given offset.
+
+    Facilitates zero-copy shared-memory ring buffer writes using struct.Struct.pack_into.
 
     Args:
         order: Order instance to serialize.
-        buffer: Target mutable buffer (bytearray or memoryview).
+        buffer: Target mutable buffer (bytearray, memoryview, or mmap).
         offset: Byte offset into the buffer (default: 0).
 
     Raises:
-        TypeError: If buffer is not mutable bytearray or memoryview.
+        TypeError: If buffer is not mutable, or offset is not an integer.
         ValueError: If buffer cannot fit 64 bytes at the specified offset.
     """
-    if not isinstance(buffer, (bytearray, memoryview)):
-        raise TypeError(f"Expected bytearray or memoryview, got {type(buffer).__name__}")
-    if offset < 0 or offset + ORDER_STRUCT_SIZE > len(buffer):
+    # 1. Validate buffer mutability and determine capacity
+    if isinstance(buffer, memoryview):
+        if buffer.readonly:
+            raise TypeError("Expected mutable buffer, got read-only memoryview")
+        buf_len = len(buffer)
+    elif isinstance(buffer, (bytearray, mmap.mmap)):
+        buf_len = len(buffer)
+    else:
+        try:
+            mv = memoryview(buffer)
+            if mv.readonly:
+                raise TypeError(f"Expected mutable buffer, got read-only {type(buffer).__name__}")
+            buf_len = len(mv)
+        except TypeError:
+            raise TypeError(f"Expected mutable buffer (bytearray, memoryview, or mmap), got {type(buffer).__name__}")
+
+    # 2. Validate offset and capacity bounds
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise TypeError(f"offset must be an integer, got {type(offset).__name__}")
+    if offset < 0 or offset + ORDER_STRUCT_SIZE > buf_len:
         raise ValueError(
-            f"Buffer too small: offset {offset} + {ORDER_STRUCT_SIZE} exceeds buffer size {len(buffer)}"
+            f"Buffer too small: offset {offset} + {ORDER_STRUCT_SIZE} exceeds buffer size {buf_len}"
         )
-    data = encode_order(order)
-    buffer[offset : offset + ORDER_STRUCT_SIZE] = data
+
+    # 3. Validate order fields
+    fields = _validate_order_fields(order)
+
+    # 4. Pack directly into buffer at offset (in-place zero-copy write)
+    ORDER_STRUCT.pack_into(buffer, offset, *fields)
 
 
-def decode_order_from(buffer: bytes | bytearray | memoryview, offset: int = 0) -> Order:
+def decode_order_from(
+    buffer: bytes | bytearray | memoryview | mmap.mmap | Any,
+    offset: int = 0,
+) -> Order:
     """Decode an Order from a buffer at the given offset.
 
-    Facilitates zero-copy shared-memory ring buffer reads.
+    Facilitates zero-copy shared-memory ring buffer reads using struct.Struct.unpack_from.
 
     Args:
-        buffer: Source bytes, bytearray, or memoryview buffer.
+        buffer: Source bytes, bytearray, memoryview, or mmap buffer.
         offset: Byte offset into the buffer (default: 0).
 
     Returns:
         Reconstructed Order instance.
 
     Raises:
-        TypeError: If buffer is not bytes-like.
-        ValueError: If buffer does not contain at least 64 bytes at the specified offset.
+        TypeError: If buffer is not bytes-like or offset is not an integer.
+        ValueError: If buffer does not contain at least 64 bytes at the specified offset,
+                    or if any field value is invalid/malformed.
     """
-    if not isinstance(buffer, (bytes, bytearray, memoryview)):
-        raise TypeError(f"Expected bytes-like object, got {type(buffer).__name__}")
-    if offset < 0 or offset + ORDER_STRUCT_SIZE > len(buffer):
+    # 1. Validate buffer
+    if isinstance(buffer, (bytes, bytearray, memoryview, mmap.mmap)):
+        buf_len = len(buffer)
+    else:
+        try:
+            buf_len = len(memoryview(buffer))
+        except TypeError:
+            raise TypeError(f"Expected bytes-like object, got {type(buffer).__name__}")
+
+    # 2. Validate offset and bounds
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise TypeError(f"offset must be an integer, got {type(offset).__name__}")
+    if offset < 0 or offset + ORDER_STRUCT_SIZE > buf_len:
         raise ValueError(
-            f"Buffer too small: offset {offset} + {ORDER_STRUCT_SIZE} exceeds buffer size {len(buffer)}"
+            f"Buffer too small: offset {offset} + {ORDER_STRUCT_SIZE} exceeds buffer size {buf_len}"
         )
-    chunk = buffer[offset : offset + ORDER_STRUCT_SIZE]
-    return decode_order(chunk)
+
+    # 3. Unpack directly from buffer at offset (in-place zero-copy read)
+    try:
+        raw_fields = ORDER_STRUCT.unpack_from(buffer, offset)
+    except struct.error as e:
+        raise ValueError(f"Malformed binary order data: {e}") from e
+
+    # 4. Reconstruct and validate Order
+    return _reconstruct_order(*raw_fields)
+
+
+def decode_order(data: bytes | bytearray | memoryview | mmap.mmap | Any) -> Order:
+    """Decode a 64-byte binary order sequence back into an Order instance.
+
+    Args:
+        data: Exactly 64 bytes of binary order data.
+
+    Returns:
+        Reconstructed Order instance with original fields and types preserved.
+
+    Raises:
+        TypeError: If data is not bytes-like.
+        ValueError: If data length is not 64 bytes or any field value is invalid/malformed.
+    """
+    if isinstance(data, (bytes, bytearray, memoryview, mmap.mmap)):
+        data_len = len(data)
+    else:
+        try:
+            data_len = len(memoryview(data))
+        except TypeError:
+            raise TypeError(f"Expected bytes-like object, got {type(data).__name__}")
+
+    if data_len != ORDER_STRUCT_SIZE:
+        raise ValueError(
+            f"Expected binary order data of length {ORDER_STRUCT_SIZE} bytes, got {data_len} bytes"
+        )
+
+    return decode_order_from(data, 0)
+

@@ -48,9 +48,13 @@ import time
 from typing import Any, Iterator, Self
 
 from chronosmatch.binary_protocol import (
+    ORDER_STRUCT,
     ORDER_STRUCT_SIZE,
+    _validate_order_fields,
     decode_order,
+    decode_order_from,
     encode_order,
+    encode_order_into,
 )
 from chronosmatch.models import Order
 from chronosmatch.shared_memory import (
@@ -467,15 +471,19 @@ class RingBuffer:
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
                 raise ValueError(f"timeout must be a non-negative number or None, got {timeout}")
 
-        # Validate and prepare binary payload
-        if isinstance(item, Order):
-            data = encode_order(item)
+        # Validate and prepare payload
+        is_order = isinstance(item, Order)
+        if is_order:
+            if self._record_size != ORDER_STRUCT_SIZE:
+                raise SharedMemoryRecordSizeError(
+                    f"Record size mismatch: expected {self._record_size} bytes, got {ORDER_STRUCT_SIZE} bytes"
+                )
+            order_fields = _validate_order_fields(item)
         elif isinstance(item, (bytes, bytearray, memoryview)):
             if len(item) != self._record_size:
                 raise SharedMemoryRecordSizeError(
                     f"Record size mismatch: expected {self._record_size} bytes, got {len(item)} bytes"
                 )
-            data = bytes(item)
         else:
             raise TypeError(f"item must be an Order or bytes-like object, got {type(item).__name__}")
 
@@ -509,7 +517,10 @@ class RingBuffer:
             slot_offset = SLOTS_OFFSET + slot * self._record_size
 
             # Step 1: Write record payload into slot (data written BEFORE head update)
-            self._region.write_record(slot_offset, data, record_size=self._record_size)
+            if is_order:
+                ORDER_STRUCT.pack_into(self._region.mmap, slot_offset, *order_fields)
+            else:
+                self._region.write_record(slot_offset, item, record_size=self._record_size)
 
             # Step 2: Advance head sequence counter in shared memory
             new_head = (head + 1) & UINT64_MASK
@@ -647,11 +658,63 @@ class RingBuffer:
             RingBufferEmptyError: If buffer is empty and block=False or timeout expires.
             MalformedRecordError: If binary data in the record fails decoding.
         """
-        raw_bytes = self.get_record(block=block, timeout=timeout)
-        try:
-            return decode_order(raw_bytes)
-        except (ValueError, TypeError) as e:
-            raise MalformedRecordError(f"Malformed order record in ring buffer: {e}") from e
+        self._check_closed()
+        if self._read_only:
+            raise SharedMemoryReadOnlyError(
+                "Cannot consume from a read-only ring buffer because tail cannot be updated"
+            )
+
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+                raise ValueError(f"timeout must be a non-negative number or None, got {timeout}")
+
+        with self._lock:
+            self._check_closed()
+            end_time = (time.monotonic() + timeout) if (block and timeout is not None) else None
+
+            while True:
+                head, tail = self._read_counters()
+                occupied = (head - tail) & UINT64_MASK
+                if occupied > 0:
+                    break  # Record available
+
+                if not block:
+                    raise RingBufferEmptyError("Ring buffer is empty")
+
+                if end_time is not None:
+                    remaining = end_time - time.monotonic()
+                    if remaining <= 0:
+                        raise RingBufferEmptyError("Timeout waiting to get from ring buffer")
+                    self._not_empty.wait(timeout=min(remaining, 0.005))
+                else:
+                    self._not_empty.wait(timeout=0.005)
+
+                self._check_closed()
+
+            # Record available: calculate slot offset
+            slot = self._slot_index(tail)
+            slot_offset = SLOTS_OFFSET + slot * self._record_size
+
+            # In-place decode directly from shared memory
+            decode_error: Exception | None = None
+            try:
+                order = decode_order_from(self._region.mmap, slot_offset)
+            except (ValueError, TypeError) as e:
+                decode_error = e
+
+            # Advance tail sequence counter in shared memory
+            new_tail = (tail + 1) & UINT64_MASK
+            self._write_tail(new_tail)
+
+            # Notify waiting producers
+            self._not_full.notify()
+
+            if decode_error is not None:
+                raise MalformedRecordError(
+                    f"Malformed order record in ring buffer: {decode_error}"
+                ) from decode_error
+
+            return order
 
     def get_nowait(self) -> Order:
         """Read and remove the next order without blocking.
@@ -704,11 +767,18 @@ class RingBuffer:
             RingBufferEmptyError: If empty.
             MalformedRecordError: If binary data fails decoding.
         """
-        raw_bytes = self.peek_record()
-        try:
-            return decode_order(raw_bytes)
-        except (ValueError, TypeError) as e:
-            raise MalformedRecordError(f"Malformed order record in ring buffer: {e}") from e
+        self._check_closed()
+        with self._lock:
+            head, tail = self._read_counters()
+            occupied = (head - tail) & UINT64_MASK
+            if occupied == 0:
+                raise RingBufferEmptyError("Ring buffer is empty")
+            slot = self._slot_index(tail)
+            slot_offset = SLOTS_OFFSET + slot * self._record_size
+            try:
+                return decode_order_from(self._region.mmap, slot_offset)
+            except (ValueError, TypeError) as e:
+                raise MalformedRecordError(f"Malformed order record in ring buffer: {e}") from e
 
     def clear(self) -> None:
         """Clear all unread records from the buffer by setting tail = head.

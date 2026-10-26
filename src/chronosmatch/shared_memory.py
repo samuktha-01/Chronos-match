@@ -37,7 +37,9 @@ from typing import Any, BinaryIO, Self
 from chronosmatch.binary_protocol import (
     ORDER_STRUCT_SIZE,
     decode_order,
+    decode_order_from,
     encode_order,
+    encode_order_into,
 )
 from chronosmatch.models import Order
 
@@ -404,7 +406,7 @@ class SharedMemoryRegion:
     def write_order(self, order: Order, offset: int = 0) -> None:
         """Serialize an Order instance and write its 64-byte record at offset.
 
-        Uses the exact Phase 6 binary encoding layout (<Q32sqIBBBBQ).
+        Uses the exact binary encoding layout (<Q32sqIBBBBQ).
 
         Args:
             order: Order instance to encode and write.
@@ -418,13 +420,17 @@ class SharedMemoryRegion:
         """
         if not isinstance(order, Order):
             raise TypeError(f"Expected Order instance, got {type(order).__name__}")
-        encoded_data = encode_order(order)
-        self.write_record(offset, encoded_data, record_size=ORDER_STRUCT_SIZE)
+        self._check_closed()
+        if self._read_only:
+            raise SharedMemoryReadOnlyError("Cannot write to a read-only shared-memory mapping")
+        offset, length = self._validate_offset_and_size(offset, ORDER_STRUCT_SIZE)
+        assert self._mmap is not None
+        encode_order_into(order, self._mmap, offset=offset)
 
     def read_order(self, offset: int = 0) -> Order:
         """Read 64 bytes at offset and decode into an Order instance.
 
-        Uses the exact Phase 6 binary decoding routine.
+        Uses the exact binary decoding routine.
 
         Args:
             offset: Byte offset in the region where the record begins (default: 0).
@@ -437,9 +443,11 @@ class SharedMemoryRegion:
             SharedMemoryClosedError: If region is closed.
             MalformedRecordError: If binary data is corrupt or cannot be decoded.
         """
-        raw_data = self.read_record(offset, record_size=ORDER_STRUCT_SIZE)
+        self._check_closed()
+        offset, length = self._validate_offset_and_size(offset, ORDER_STRUCT_SIZE)
+        assert self._mmap is not None
         try:
-            return decode_order(raw_data)
+            return decode_order_from(self._mmap, offset=offset)
         except (ValueError, TypeError) as e:
             raise MalformedRecordError(
                 f"Malformed order record at offset {offset}: {e}"

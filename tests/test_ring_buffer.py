@@ -961,3 +961,103 @@ class TestMultiProcessConcurrency:
                     filepath.unlink()
                 except Exception:
                     pass
+
+
+class TestInPlaceRingBufferOptimization:
+    """Targeted tests for in-place serialization integration with RingBuffer."""
+
+    def test_continuous_in_place_wraparound_power_of_two(self) -> None:
+        """Verify 1,000 orders stream across power-of-two ring buffer wraparounds with exact preservation."""
+        rb = RingBuffer(capacity=8)
+        num_orders = 1000
+
+        for i in range(num_orders):
+            price_val = 100.50 if i % 2 == 0 else Decimal("200.12345678")
+            order = Order(
+                order_id=f"wrap2-{i:05d}",
+                side=OrderSide.BUY if i % 2 == 0 else OrderSide.SELL,
+                price=price_val,
+                quantity=10 + (i % 50),
+                timestamp=1700000000000000000 + i,
+                sequence_number=i if i % 3 != 0 else None,
+            )
+            rb.put(order)
+            retrieved = rb.get()
+
+            assert retrieved.order_id == order.order_id
+            assert retrieved.side == order.side
+            assert retrieved.price == order.price
+            assert type(retrieved.price) is type(order.price)
+            assert retrieved.quantity == order.quantity
+            assert retrieved.timestamp == order.timestamp
+            assert retrieved.sequence_number == order.sequence_number
+
+        assert rb.is_empty
+        assert rb.head == num_orders
+        assert rb.tail == num_orders
+        rb.close()
+
+    def test_continuous_in_place_wraparound_non_power_of_two(self) -> None:
+        """Verify batched wraparound across non-power-of-two capacity (modulo mapping)."""
+        capacity = 7  # Non-power of two
+        rb = RingBuffer(capacity=capacity)
+        total_batches = 50
+        batch_size = 5
+
+        for batch_idx in range(total_batches):
+            orders = [
+                Order(
+                    order_id=f"np2-{batch_idx:03d}-{j}",
+                    side=OrderSide.BUY if j % 2 == 0 else OrderSide.SELL,
+                    price=50.0 + j,
+                    quantity=100 + j,
+                    timestamp=1710000000000000000 + batch_idx * 10 + j,
+                    sequence_number=batch_idx * 10 + j,
+                )
+                for j in range(batch_size)
+            ]
+            for o in orders:
+                rb.put(o)
+
+            assert rb.occupied == batch_size
+
+            for expected in orders:
+                actual = rb.get()
+                assert actual == expected
+
+            assert rb.is_empty
+
+        assert rb.head == total_batches * batch_size
+        assert rb.tail == total_batches * batch_size
+        rb.close()
+
+    def test_ring_buffer_zero_copy_raw_records(self) -> None:
+        """Verify putting and getting bytearray and memoryview directly without intermediate conversions."""
+        rb = RingBuffer(capacity=4)
+        raw_ba = bytearray(b"X" * ORDER_STRUCT_SIZE)
+        raw_mv = memoryview(bytearray(b"Y" * ORDER_STRUCT_SIZE))
+
+        rb.put(raw_ba)
+        rb.put(raw_mv)
+
+        assert rb.occupied == 2
+
+        rec1 = rb.get_record()
+        rec2 = rb.get_record()
+
+        assert rec1 == bytes(raw_ba)
+        assert rec2 == bytes(raw_mv)
+        rb.close()
+
+    def test_capacity_one_in_place_streaming(self) -> None:
+        """Verify tight boundary conditions with capacity=1 ring buffer."""
+        rb = RingBuffer(capacity=1)
+        for i in range(100):
+            ord_in = Order(f"cap1-{i:03d}", OrderSide.BUY, 10.0 + i, 1)
+            rb.put(ord_in)
+            assert rb.is_full
+            ord_out = rb.get()
+            assert ord_out == ord_in
+            assert rb.is_empty
+        rb.close()
+

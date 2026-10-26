@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 import math
+import mmap
 import struct
 import time
 
@@ -494,3 +495,140 @@ class TestBufferAndMemoryViewOperations:
         small_buf = bytearray(64)
         with pytest.raises(ValueError, match="Buffer too small"):
             decode_order_from(small_buf, offset=1)
+
+    def test_encoding_decoding_equivalence_across_price_types(self) -> None:
+        """Verify encode_order_into produces bit-identical output to encode_order and decodes equivalently."""
+        sample_orders = [
+            Order("eq-float", OrderSide.BUY, 123.45, 100, timestamp=1700000000000000001, sequence_number=10),
+            Order("eq-int", OrderSide.SELL, 250, 50, timestamp=1700000000000000002, sequence_number=None),
+            Order("eq-dec", OrderSide.BUY, Decimal("99.98765432"), 1, timestamp=1700000000000000003, sequence_number=0),
+        ]
+        buf = bytearray(256)
+        for i, order in enumerate(sample_orders):
+            offset = i * 64 + 16  # Test nonzero offset
+            encode_order_into(order, buf, offset=offset)
+
+            # Equivalence with encode_order
+            expected_bytes = encode_order(order)
+            assert bytes(buf[offset : offset + 64]) == expected_bytes
+
+            # Equivalence of decode_order and decode_order_from
+            from_buf = decode_order_from(buf, offset=offset)
+            from_bytes = decode_order(expected_bytes)
+
+            assert from_buf == order
+            assert from_bytes == order
+            assert from_buf == from_bytes
+            assert type(from_buf.price) is type(order.price)
+            assert from_buf.sequence_number == order.sequence_number
+
+    def test_encode_into_and_decode_from_mmap(self) -> None:
+        """Verify in-place zero-copy serialization directly with mmap regions."""
+        mm = mmap.mmap(-1, 256)
+        try:
+            ord1 = Order("mm-01", OrderSide.BUY, 101.50, 200, sequence_number=1)
+            ord2 = Order("mm-02", OrderSide.SELL, 102.75, 300, sequence_number=2)
+
+            encode_order_into(ord1, mm, offset=0)
+            encode_order_into(ord2, mm, offset=64)
+
+            # Check that bytes in mmap match encode_order
+            assert bytes(mm[0:64]) == encode_order(ord1)
+            assert bytes(mm[64:128]) == encode_order(ord2)
+
+            # Decode directly from mmap
+            res1 = decode_order_from(mm, offset=0)
+            res2 = decode_order_from(mm, offset=64)
+
+            assert res1 == ord1
+            assert res2 == ord2
+        finally:
+            mm.close()
+
+    def test_arbitrary_nonzero_offsets(self) -> None:
+        """Verify packing and unpacking at arbitrary nonzero offsets within larger buffers."""
+        offsets = [7, 13, 31, 64, 127]
+        order = Order("ord-arb-offset", OrderSide.BUY, 77.25, 42, sequence_number=99)
+        expected_bytes = encode_order(order)
+
+        for off in offsets:
+            buf = bytearray(off + 64 + 32)
+            encode_order_into(order, buf, offset=off)
+            assert bytes(buf[off : off + 64]) == expected_bytes
+
+            decoded = decode_order_from(buf, offset=off)
+            assert decoded == order
+
+    def test_exact_capacity_boundaries(self) -> None:
+        """Verify exact boundary fits succeed while 1-byte deficits fail."""
+        buf = bytearray(64)
+        order = Order("ord-boundary", OrderSide.BUY, 10.0, 1)
+
+        # Exact fit at offset 0
+        encode_order_into(order, buf, offset=0)
+        assert decode_order_from(buf, offset=0) == order
+
+        # 1-byte overflow at offset 1
+        with pytest.raises(ValueError, match="Buffer too small"):
+            encode_order_into(order, buf, offset=1)
+        with pytest.raises(ValueError, match="Buffer too small"):
+            decode_order_from(buf, offset=1)
+
+        # Buffer of size 128
+        buf128 = bytearray(128)
+        encode_order_into(order, buf128, offset=64)
+        assert decode_order_from(buf128, offset=64) == order
+
+        with pytest.raises(ValueError, match="Buffer too small"):
+            encode_order_into(order, buf128, offset=65)
+        with pytest.raises(ValueError, match="Buffer too small"):
+            decode_order_from(buf128, offset=65)
+
+    def test_invalid_offset_types_raise_type_error(self) -> None:
+        """Verify non-integer offsets raise TypeError for both encode_order_into and decode_order_from."""
+        buf = bytearray(128)
+        order = Order("ord-type", OrderSide.BUY, 10.0, 1)
+
+        for bad_offset in ["0", 1.5, True, False, None]:
+            with pytest.raises(TypeError, match="offset must be an integer"):
+                encode_order_into(order, buf, offset=bad_offset)  # type: ignore[arg-type]
+            with pytest.raises(TypeError, match="offset must be an integer"):
+                decode_order_from(buf, offset=bad_offset)  # type: ignore[arg-type]
+
+    def test_negative_offsets_raise_value_error(self) -> None:
+        """Verify negative offsets raise ValueError."""
+        buf = bytearray(128)
+        order = Order("ord-neg", OrderSide.BUY, 10.0, 1)
+
+        for neg_offset in [-1, -64, -100]:
+            with pytest.raises(ValueError, match="Buffer too small"):
+                encode_order_into(order, buf, offset=neg_offset)
+            with pytest.raises(ValueError, match="Buffer too small"):
+                decode_order_from(buf, offset=neg_offset)
+
+    def test_reject_read_only_buffers_for_encoding(self) -> None:
+        """Verify immutable/read-only buffers are rejected with TypeError when encoding."""
+        order = Order("ord-ro", OrderSide.BUY, 10.0, 1)
+
+        # Immutable bytes
+        ro_bytes = bytes(64)
+        with pytest.raises(TypeError, match="Expected mutable buffer"):
+            encode_order_into(order, ro_bytes, offset=0)
+
+        # Read-only memoryview
+        ro_view = memoryview(ro_bytes)
+        assert ro_view.readonly
+        with pytest.raises(TypeError, match="Expected mutable buffer"):
+            encode_order_into(order, ro_view, offset=0)
+
+    def test_decode_from_corrupt_record_at_nonzero_offset(self) -> None:
+        """Verify malformed binary record at nonzero offset raises ValueError."""
+        buf = bytearray(128)
+        order = Order("ord-valid", OrderSide.BUY, 100.0, 10)
+        encode_order_into(order, buf, offset=30)
+
+        # Corrupt side code at offset 30 + 52 = 82
+        buf[82] = 99
+        with pytest.raises(ValueError, match="Unknown side code: 99"):
+            decode_order_from(buf, offset=30)
+
