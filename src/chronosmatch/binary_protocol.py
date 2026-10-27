@@ -181,24 +181,34 @@ def _validate_and_scale_price(price: Any) -> tuple[int, int]:
 
     if isinstance(price, int):
         price_type = PRICE_TYPE_INT
-        d = Decimal(price)
+        ticks = price * PRICE_SCALE
     elif isinstance(price, float):
         price_type = PRICE_TYPE_FLOAT
-        d = Decimal(str(price))
+        s = str(price)
+        dot_idx = s.find(".")
+        if dot_idx != -1 and (len(s) - dot_idx - 1) > 8:
+            d = Decimal(s)
+            d_ticks = d * Decimal(PRICE_SCALE)
+            if d_ticks != d_ticks.to_integral_value():
+                raise ValueError(
+                    f"price {price} cannot be represented without losing precision at scale {PRICE_SCALE} "
+                    f"(maximum 8 decimal places supported)"
+                )
+            ticks = int(d_ticks)
+        else:
+            ticks = round(price * PRICE_SCALE)
     elif isinstance(price, Decimal):
         price_type = PRICE_TYPE_DECIMAL
-        d = price
+        d_ticks = price * Decimal(PRICE_SCALE)
+        if d_ticks != d_ticks.to_integral_value():
+            raise ValueError(
+                f"price {price} cannot be represented without losing precision at scale {PRICE_SCALE} "
+                f"(maximum 8 decimal places supported)"
+            )
+        ticks = int(d_ticks)
     else:
         raise TypeError(f"Unsupported price type: {type(price).__name__}")
 
-    d_ticks = d * Decimal(PRICE_SCALE)
-    if d_ticks != d_ticks.to_integral_value():
-        raise ValueError(
-            f"price {price} cannot be represented without losing precision at scale {PRICE_SCALE} "
-            f"(maximum 8 decimal places supported)"
-        )
-
-    ticks = int(d_ticks)
     if ticks <= 0:
         raise ValueError(f"price ticks must be strictly positive (> 0), got {ticks}")
     if ticks > INT64_MAX:

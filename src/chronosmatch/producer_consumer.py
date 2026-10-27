@@ -174,9 +174,13 @@ class OrderProducer:
         """Publish an order without blocking.
 
         Raises:
+            TypeError: If order is not an Order instance.
             RingBufferFullError: If buffer is full.
+            RingBufferClosedError: If buffer is closed.
         """
-        self.publish(order, block=False)
+        if not isinstance(order, Order):
+            raise TypeError(f"order must be an Order instance, got {type(order).__name__}")
+        self._producer.put_nowait(order)
 
     def publish_batch(
         self,
@@ -345,7 +349,7 @@ class OrderConsumer:
         Raises:
             RingBufferEmptyError: If buffer is empty.
         """
-        return self.receive(block=False)
+        return self._consumer.get_nowait()
 
     def poll(self, timeout: float | None = None) -> Order | None:
         """Poll for an order with a timeout, returning None instead of raising if empty.

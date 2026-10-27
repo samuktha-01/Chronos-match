@@ -218,6 +218,12 @@ class RingBuffer:
         self._is_power_of_two: bool = (self._capacity & (self._capacity - 1)) == 0 and self._capacity > 0
         self._mask: int | None = (self._capacity - 1) if self._is_power_of_two else None
 
+        # SPSC local counter cache: avoids repetitive mmap unpack_from on every operation
+        self._cached_head: int = 0
+        self._cached_tail: int = 0
+        if not create:
+            self._cached_head, self._cached_tail = self._read_counters()
+
     # --------------------------------------------------------------------------
     # Validation & Header Management
     # --------------------------------------------------------------------------
@@ -294,6 +300,16 @@ class RingBuffer:
         head = struct.unpack_from(COUNTER_FORMAT, self._region.mmap, HEAD_OFFSET)[0]
         tail = struct.unpack_from(COUNTER_FORMAT, self._region.mmap, TAIL_OFFSET)[0]
         return head, tail
+
+    def _read_head(self) -> int:
+        """Read current producer head sequence counter from shared memory."""
+        self._check_closed()
+        return struct.unpack_from(COUNTER_FORMAT, self._region.mmap, HEAD_OFFSET)[0]
+
+    def _read_tail(self) -> int:
+        """Read current consumer tail sequence counter from shared memory."""
+        self._check_closed()
+        return struct.unpack_from(COUNTER_FORMAT, self._region.mmap, TAIL_OFFSET)[0]
 
     def _write_head(self, new_head: int) -> None:
         """Update producer write sequence number in shared memory."""
@@ -401,30 +417,36 @@ class RingBuffer:
     @property
     def head(self) -> int:
         """Current monotonic producer sequence counter."""
-        head, _ = self._read_counters()
-        return head
+        self._cached_head = self._read_head()
+        return self._cached_head
 
     @property
     def tail(self) -> int:
         """Current monotonic consumer sequence counter."""
-        _, tail = self._read_counters()
-        return tail
+        self._cached_tail = self._read_tail()
+        return self._cached_tail
 
     @property
     def occupied(self) -> int:
         """Number of unread records currently residing in the buffer."""
-        head, tail = self._read_counters()
-        return (head - tail) & UINT64_MASK
+        self._cached_head, self._cached_tail = self._read_counters()
+        return (self._cached_head - self._cached_tail) & UINT64_MASK
 
     @property
     def is_empty(self) -> bool:
         """True if the buffer contains zero unread records."""
-        return self.occupied == 0
+        head, tail = self._read_counters()
+        self._cached_head = head
+        self._cached_tail = tail
+        return ((head - tail) & UINT64_MASK) == 0
 
     @property
     def is_full(self) -> bool:
         """True if the buffer is at maximum capacity."""
-        return self.occupied >= self._capacity
+        head, tail = self._read_counters()
+        self._cached_head = head
+        self._cached_tail = tail
+        return ((head - tail) & UINT64_MASK) >= self._capacity
 
     @property
     def available_write(self) -> int:
@@ -491,11 +513,17 @@ class RingBuffer:
             self._check_closed()
             end_time = (time.monotonic() + timeout) if (block and timeout is not None) else None
 
+            head = self._cached_head
             while True:
-                head, tail = self._read_counters()
-                occupied = (head - tail) & UINT64_MASK
+                occupied = (head - self._cached_tail) & UINT64_MASK
                 if occupied < self._capacity:
-                    break  # Free slot available
+                    break  # Free slot available from cache
+
+                # Refresh tail from shared memory
+                self._cached_tail = self._read_tail()
+                occupied = (head - self._cached_tail) & UINT64_MASK
+                if occupied < self._capacity:
+                    break  # Free slot available after reload
 
                 if not block:
                     raise RingBufferFullError(f"Ring buffer is full (capacity={self._capacity})")
@@ -522,8 +550,9 @@ class RingBuffer:
             else:
                 self._region.write_record(slot_offset, item, record_size=self._record_size)
 
-            # Step 2: Advance head sequence counter in shared memory
+            # Step 2: Advance head sequence counter in shared memory and local cache
             new_head = (head + 1) & UINT64_MASK
+            self._cached_head = new_head
             self._write_head(new_head)
 
             # Step 3: Notify waiting consumers
@@ -594,11 +623,17 @@ class RingBuffer:
             self._check_closed()
             end_time = (time.monotonic() + timeout) if (block and timeout is not None) else None
 
+            tail = self._cached_tail
             while True:
-                head, tail = self._read_counters()
-                occupied = (head - tail) & UINT64_MASK
+                occupied = (self._cached_head - tail) & UINT64_MASK
                 if occupied > 0:
-                    break  # Record available
+                    break  # Record available from cache
+
+                # Refresh head from shared memory
+                self._cached_head = self._read_head()
+                occupied = (self._cached_head - tail) & UINT64_MASK
+                if occupied > 0:
+                    break  # Record available after reload
 
                 if not block:
                     raise RingBufferEmptyError("Ring buffer is empty")
@@ -620,8 +655,9 @@ class RingBuffer:
             # Step 1: Read record payload from slot (read BEFORE tail update)
             data = self._region.read_record(slot_offset, record_size=self._record_size)
 
-            # Step 2: Advance tail sequence counter in shared memory
+            # Step 2: Advance tail sequence counter in shared memory and local cache
             new_tail = (tail + 1) & UINT64_MASK
+            self._cached_tail = new_tail
             self._write_tail(new_tail)
 
             # Step 3: Notify waiting producers
@@ -672,11 +708,17 @@ class RingBuffer:
             self._check_closed()
             end_time = (time.monotonic() + timeout) if (block and timeout is not None) else None
 
+            tail = self._cached_tail
             while True:
-                head, tail = self._read_counters()
-                occupied = (head - tail) & UINT64_MASK
+                occupied = (self._cached_head - tail) & UINT64_MASK
                 if occupied > 0:
-                    break  # Record available
+                    break  # Record available from cache
+
+                # Refresh head from shared memory
+                self._cached_head = self._read_head()
+                occupied = (self._cached_head - tail) & UINT64_MASK
+                if occupied > 0:
+                    break  # Record available after reload
 
                 if not block:
                     raise RingBufferEmptyError("Ring buffer is empty")
@@ -702,8 +744,9 @@ class RingBuffer:
             except (ValueError, TypeError) as e:
                 decode_error = e
 
-            # Advance tail sequence counter in shared memory
+            # Advance tail sequence counter in shared memory and local cache
             new_tail = (tail + 1) & UINT64_MASK
+            self._cached_tail = new_tail
             self._write_tail(new_tail)
 
             # Notify waiting producers
@@ -792,6 +835,8 @@ class RingBuffer:
             raise SharedMemoryReadOnlyError("Cannot clear a read-only ring buffer")
         with self._lock:
             head, _ = self._read_counters()
+            self._cached_head = head
+            self._cached_tail = head
             self._write_tail(head)
             self._not_full.notify_all()
 

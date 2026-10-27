@@ -468,6 +468,22 @@ class MarketSimulator:
         self._is_running: bool = False
         self._burst_remaining: int = 0
 
+        # Precomputed fast-path parameters to eliminate per-order math.log10 and divisions
+        self._price_tick: float = float(self.config.price_tick)
+        self._inv_tick: float = 1.0 / self._price_tick if self._price_tick > 0 else 1.0
+        tick_decimals = max(0, -int(math.floor(math.log10(self._price_tick)))) if self._price_tick < 1.0 else 2
+        self._round_precision: int = min(8, tick_decimals + 2)
+        self._min_price: float = float(self.config.min_price)
+        self._max_price: float = float(self.config.max_price)
+        self._volatility_factor: float = self.config.price_volatility * self._price_tick
+        self._half_spread: float = max(
+            self._price_tick,
+            (self.config.spread_ticks * self._price_tick) / 2.0,
+        )
+        self._quantity_steps: int = (
+            (self.config.max_quantity - self.config.min_quantity) // self.config.quantity_step
+        )
+
     # --------------------------------------------------------------------------
     # Lifecycle & State Control
     # --------------------------------------------------------------------------
@@ -513,12 +529,13 @@ class MarketSimulator:
 
     def _quantize_price(self, price: float) -> float:
         """Quantize and clamp price within [min_price, max_price]."""
-        p = _round_to_tick(price, self.config.price_tick)
-        return max(self.config.min_price, min(self.config.max_price, p))
+        ticks = round(price * self._inv_tick)
+        raw = round(ticks * self._price_tick, self._round_precision)
+        return max(self._min_price, min(self._max_price, raw))
 
     def _update_mid_price(self) -> None:
         """Drift reference mid-price via Gaussian random walk."""
-        delta = self._rng.gauss(0.0, self.config.price_volatility * self.config.price_tick)
+        delta = self._rng.gauss(0.0, self._volatility_factor)
         self._current_mid_price = self._quantize_price(self._current_mid_price + delta)
 
     def next_order(self) -> Order:
@@ -529,14 +546,10 @@ class MarketSimulator:
         """
         self._update_mid_price()
 
-        half_spread = max(
-            self.config.price_tick,
-            (self.config.spread_ticks * self.config.price_tick) / 2.0,
-        )
-        ref_bid = self._quantize_price(max(self.config.min_price, self._current_mid_price - half_spread))
-        ref_ask = self._quantize_price(min(self.config.max_price, self._current_mid_price + half_spread))
+        ref_bid = self._quantize_price(max(self._min_price, self._current_mid_price - self._half_spread))
+        ref_ask = self._quantize_price(min(self._max_price, self._current_mid_price + self._half_spread))
         if ref_bid >= ref_ask:
-            ref_ask = self._quantize_price(min(self.config.max_price, ref_bid + self.config.price_tick))
+            ref_ask = self._quantize_price(min(self._max_price, ref_bid + self._price_tick))
 
         is_buy: bool = self._rng.random() < self.config.buy_ratio
         is_crossing: bool = self._rng.random() < self.config.crossing_probability
@@ -545,25 +558,24 @@ class MarketSimulator:
             # Aggressive taker order that crosses the spread
             if is_buy:
                 # Crosses ask to match resting asks
-                tick_offset = self._rng.randint(0, 2) * self.config.price_tick
-                price = self._quantize_price(min(self.config.max_price, ref_ask + tick_offset))
+                tick_offset = self._rng.randint(0, 2) * self._price_tick
+                price = self._quantize_price(min(self._max_price, ref_ask + tick_offset))
             else:
                 # Crosses bid to match resting bids
-                tick_offset = self._rng.randint(0, 2) * self.config.price_tick
-                price = self._quantize_price(max(self.config.min_price, ref_bid - tick_offset))
+                tick_offset = self._rng.randint(0, 2) * self._price_tick
+                price = self._quantize_price(max(self._min_price, ref_bid - tick_offset))
             self.metrics.crossing_orders += 1
         else:
             # Passive maker order that posts inside or deep in the book
-            depth_steps = self._rng.randint(0, 5) * self.config.price_tick
+            depth_steps = self._rng.randint(0, 5) * self._price_tick
             if is_buy:
-                price = self._quantize_price(max(self.config.min_price, ref_bid - depth_steps))
+                price = self._quantize_price(max(self._min_price, ref_bid - depth_steps))
             else:
-                price = self._quantize_price(min(self.config.max_price, ref_ask + depth_steps))
+                price = self._quantize_price(min(self._max_price, ref_ask + depth_steps))
             self.metrics.passive_orders += 1
 
         # Quantize quantity with step size
-        steps = (self.config.max_quantity - self.config.min_quantity) // self.config.quantity_step
-        step_idx = self._rng.randint(0, steps) if steps > 0 else 0
+        step_idx = self._rng.randint(0, self._quantity_steps) if self._quantity_steps > 0 else 0
         quantity = self.config.min_quantity + step_idx * self.config.quantity_step
 
         self._sequence_number += 1
@@ -663,40 +675,7 @@ class MarketSimulator:
 
         mode = self.config.backpressure_mode
 
-        # Check for initial backpressure
-        if producer.is_full:
-            self.metrics.backpressure_events += 1
-
-            if mode == BackpressureMode.DROP:
-                self.metrics.orders_dropped += 1
-                return False
-
-            if mode == BackpressureMode.RAISE:
-                raise RingBufferFullError(
-                    f"Downstream ring buffer is full (capacity={producer.capacity})"
-                )
-
-            # WAIT mode: asynchronous backpressure poll
-            wait_start = time.monotonic()
-            timeout = self.config.backpressure_timeout
-
-            while producer.is_full:
-                if self._stop_event.is_set():
-                    return False
-
-                if timeout is not None and (time.monotonic() - wait_start) >= timeout:
-                    raise BackpressureTimeoutError(
-                        f"Backpressure timeout of {timeout}s exceeded waiting for ring buffer space"
-                    )
-
-                await asyncio.sleep(self.config.backpressure_poll_interval)
-
-                if producer.is_closed:
-                    raise RingBufferClosedError("OrderProducer closed during backpressure wait")
-
-            self.metrics.total_backpressure_wait_seconds += time.monotonic() - wait_start
-
-        # Attempt publication (retry if transient race condition occurs)
+        # Optimistic publication attempt; enter backpressure handling only on full buffer
         while True:
             if self._stop_event.is_set():
                 return False
@@ -713,9 +692,11 @@ class MarketSimulator:
                     return False
 
                 if mode == BackpressureMode.RAISE:
-                    raise
+                    raise RingBufferFullError(
+                        f"Downstream ring buffer is full (capacity={producer.capacity})"
+                    )
 
-                # Re-enter async wait
+                # WAIT mode: asynchronous backpressure poll
                 wait_start = time.monotonic()
                 timeout = self.config.backpressure_timeout
                 while producer.is_full:
@@ -880,7 +861,7 @@ class MarketSimulator:
                 delay = self.next_inter_arrival_time()
                 if delay > 0.0:
                     await asyncio.sleep(delay)
-                else:
+                elif count & 31 == 0:
                     await asyncio.sleep(0)
 
         except asyncio.CancelledError:
