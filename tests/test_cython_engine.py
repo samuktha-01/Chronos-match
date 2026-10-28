@@ -554,3 +554,117 @@ class TestCythonCancellationAndEngineDetection:
             assert pipeline.is_cython_accelerated is False
         finally:
             pipeline.cleanup()
+
+
+# ==============================================================================
+# 5. Pipeline Default Engine Selection & Fallback Tests
+# ==============================================================================
+
+
+class TestPipelineEngineSelection:
+    """Verify default engine selection and fallback behavior in TradingPipeline."""
+
+    def test_get_default_matching_engine_selects_cython_when_compiled(self) -> None:
+        """Verify get_default_matching_engine() returns CythonMatchingEngine when compiled."""
+        from chronosmatch import get_default_matching_engine
+
+        engine = get_default_matching_engine()
+        if is_cython_compiled():
+            from chronosmatch.cython_engine import _CompiledCythonMatchingEngine
+
+            assert _CompiledCythonMatchingEngine is not None
+            assert isinstance(engine, _CompiledCythonMatchingEngine)
+        else:
+            assert isinstance(engine, MatchingEngine)
+
+    def test_default_pipeline_uses_native_cython_when_available(self) -> None:
+        """Verify create_pipeline() selects CythonMatchingEngine by default when compiled."""
+        pipeline = create_pipeline(capacity=64)
+        try:
+            if is_cython_compiled():
+                from chronosmatch.cython_engine import _CompiledCythonMatchingEngine
+
+                assert _CompiledCythonMatchingEngine is not None
+                assert isinstance(pipeline.engine, _CompiledCythonMatchingEngine)
+                assert pipeline.is_cython_accelerated is True
+            else:
+                assert isinstance(pipeline.engine, MatchingEngine)
+                assert pipeline.is_cython_accelerated is False
+        finally:
+            pipeline.cleanup()
+
+    def test_default_pipeline_falls_back_to_python_when_cython_unavailable(self) -> None:
+        """Verify pipeline falls back to MatchingEngine when native acceleration is unavailable."""
+        from unittest.mock import patch
+        from chronosmatch import get_default_matching_engine
+
+        with patch("chronosmatch.pipeline.is_cython_compiled", return_value=False):
+            fallback_engine = get_default_matching_engine()
+            assert isinstance(fallback_engine, MatchingEngine)
+
+            pipeline = create_pipeline(capacity=64)
+            try:
+                assert isinstance(pipeline.engine, MatchingEngine)
+                assert pipeline.is_cython_accelerated is False
+            finally:
+                pipeline.cleanup()
+
+    def test_explicit_engine_takes_precedence(self) -> None:
+        """Verify explicitly provided engine override is preserved over the default."""
+        # 1. Explicit MatchingEngine (pure-Python override)
+        py_engine = MatchingEngine()
+        pipeline_py = create_pipeline(engine=py_engine, capacity=64)
+        try:
+            assert pipeline_py.engine is py_engine
+            assert pipeline_py.is_cython_accelerated is False
+        finally:
+            pipeline_py.cleanup()
+
+        # 2. Explicit CythonMatchingEngine
+        cy_engine = CythonMatchingEngine()
+        pipeline_cy = create_pipeline(engine=cy_engine, capacity=64)
+        try:
+            assert pipeline_cy.engine is cy_engine
+            assert pipeline_cy.is_cython_accelerated is is_cython_compiled()
+        finally:
+            pipeline_cy.cleanup()
+
+    def test_pipeline_matching_correctness_under_default_engine(self) -> None:
+        """Verify matching and book state under default pipeline match reference engine."""
+        pipeline = create_pipeline(capacity=64)
+        ref_engine = MatchingEngine()
+        try:
+            maker = Order("M-01", OrderSide.SELL, 100.0, 50, 1_000_000_000, 1)
+            taker = Order("T-01", OrderSide.BUY, 100.0, 30, 2_000_000_000, 2)
+
+            trades_pipe = pipeline.process_order(maker)
+            trades_ref = ref_engine.process_order(maker)
+            assert len(trades_pipe) == len(trades_ref) == 0
+
+            trades_pipe = pipeline.process_order(taker)
+            trades_ref = ref_engine.process_order(taker)
+            assert len(trades_pipe) == len(trades_ref) == 1
+            assert trades_pipe[0].price == trades_ref[0].price == 100.0
+            assert trades_pipe[0].quantity == trades_ref[0].quantity == 30
+            assert pipeline.best_ask == ref_engine.best_ask == 100.0
+            assert pipeline.best_bid == ref_engine.best_bid is None
+        finally:
+            pipeline.cleanup()
+
+    def test_dashboard_reports_correct_acceleration_under_default_pipeline(self) -> None:
+        """Verify dashboard runner accurately reflects default pipeline engine acceleration."""
+        pipeline = create_pipeline(capacity=64)
+        runner = PipelineDashboardRunner(pipeline=pipeline, interactive=False)
+        try:
+            snapshot = runner.collector.take_snapshot()
+            rendered = runner.dashboard.render_to_string(snapshot)
+            if is_cython_compiled():
+                assert snapshot.is_cython_accelerated is True
+                assert "Core: Cython" in rendered
+                assert "Core: Python" not in rendered
+            else:
+                assert snapshot.is_cython_accelerated is False
+                assert "Core: Python" in rendered
+                assert "Core: Cython" not in rendered
+        finally:
+            runner.close()

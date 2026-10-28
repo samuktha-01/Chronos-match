@@ -157,6 +157,25 @@ class TradingPipelineMetrics:
 
 
 # ==============================================================================
+# Default Engine Selection
+# ==============================================================================
+
+
+def get_default_matching_engine() -> Any:
+    """Return the default matching engine instance.
+
+    Uses native CythonMatchingEngine if compiled and available;
+    otherwise falls back to the pure-Python reference MatchingEngine.
+    """
+    if is_cython_compiled():
+        try:
+            return CythonMatchingEngine()
+        except Exception:
+            return MatchingEngine()
+    return MatchingEngine()
+
+
+# ==============================================================================
 # TradingPipeline Orchestrator
 # ==============================================================================
 
@@ -195,7 +214,7 @@ class TradingPipeline:
             config: MarketFeedConfig for synthetic order generation.
             capacity: RingBuffer capacity in 64-byte slots (ignored if ring_buffer passed).
             filepath: Optional backing file path for shared memory (None for anonymous).
-            engine: Matching engine instance (defaults to Python MatchingEngine).
+            engine: Matching engine instance (defaults to CythonMatchingEngine if compiled, else MatchingEngine).
             ring_buffer: Existing RingBuffer instance to attach to.
             wal_path: Optional file path to append-only Write-Ahead Log (WAL).
             wal: Existing WriteAheadLog instance.
@@ -208,7 +227,7 @@ class TradingPipeline:
         """
         self.config: MarketFeedConfig = config if config is not None else MarketFeedConfig()
         self.metrics: TradingPipelineMetrics = TradingPipelineMetrics()
-        self.engine: Any = engine if engine is not None else MatchingEngine()
+        self.engine: Any = engine if engine is not None else get_default_matching_engine()
         self._durability_policy = DurabilityPolicy(durability_policy)
 
         # Latency instrumentation state
@@ -953,7 +972,23 @@ def create_pipeline(
     instrument_latency: bool = False,
     latency_callback: Callable[[float | None, float | None, float | None], None] | None = None,
 ) -> TradingPipeline:
-    """Convenience factory function to instantiate a TradingPipeline."""
+    """Convenience factory function to instantiate a TradingPipeline.
+
+    Args:
+        config: MarketFeedConfig for synthetic order generation.
+        capacity: RingBuffer capacity in 64-byte slots.
+        filepath: Backing file path for shared memory (None for anonymous).
+        engine: Matching engine instance (defaults to CythonMatchingEngine if compiled, else MatchingEngine).
+        wal_path: File path to Write-Ahead Log.
+        wal: Existing WriteAheadLog instance.
+        trade_store: Existing TradeStore instance.
+        durability_policy: Durability guarantee for disk writes.
+        instrument_latency: If True, instruments core, dwell, and tick-to-trade latency.
+        latency_callback: Optional callable for latency callbacks.
+
+    Returns:
+        Configured TradingPipeline instance.
+    """
     return TradingPipeline(
         config=config,
         capacity=capacity,

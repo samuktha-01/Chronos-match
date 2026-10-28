@@ -62,6 +62,7 @@ from chronosmatch.pipeline import (
     TradingPipeline,
     TradingPipelineMetrics,
     create_pipeline,
+    get_default_matching_engine,
 )
 from chronosmatch.order_book import (
     DuplicateOrderError,
@@ -179,6 +180,7 @@ __all__ = [
     "TradingPipeline",
     "TradingPipelineMetrics",
     "create_pipeline",
+    "get_default_matching_engine",
     "DurabilityPolicy",
     "WALRecordType",
     "WALRecord",
