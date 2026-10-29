@@ -110,3 +110,27 @@ class Order:
     def is_sell(self) -> bool:
         """Return True if this is a SELL order."""
         return self.side == OrderSide.SELL
+
+    @classmethod
+    def _create_unvalidated(
+        cls,
+        order_id: str,
+        side: OrderSide | str,
+        price: float | int | Decimal,
+        quantity: int,
+        timestamp: int,
+        sequence_number: int | None = None,
+    ) -> Order:
+        """Construct an Order instance bypassing __post_init__ validation.
+
+        Internal optimization for trusted deserialization paths (such as binary protocol decoding)
+        where all fields have already been strictly validated against domain constraints.
+        """
+        instance = object.__new__(cls)
+        instance.order_id = order_id
+        instance.side = side
+        instance.price = price
+        instance.quantity = quantity
+        instance.timestamp = timestamp
+        instance.sequence_number = sequence_number
+        return instance

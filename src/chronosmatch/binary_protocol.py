@@ -59,6 +59,11 @@ UINT64_MAX: int = (1 << 64) - 1
 INT64_MAX: int = (1 << 63) - 1
 INT64_MIN: int = -(1 << 63)
 
+# Deserialization Optimizations & Cached Singletons
+_ORDER_NEW = object.__new__
+_DECIMAL_PRICE_SCALE: Decimal = Decimal(PRICE_SCALE)
+_ORDER_STRUCT_UNPACK_FROM = ORDER_STRUCT.unpack_from
+
 
 def _validate_and_encode_order_id(order_id: Any) -> bytes:
     """Validate and encode order_id into fixed 32-byte UTF-8 bytes.
@@ -112,7 +117,7 @@ def _decode_order_id(raw_id: bytes) -> str:
         order_id = id_bytes.decode("utf-8")
     except UnicodeDecodeError as e:
         raise ValueError(f"Decoded order_id contains invalid UTF-8: {e}") from e
-    if not order_id.strip():
+    if order_id.isspace():
         raise ValueError("Decoded order_id cannot be whitespace only")
     return order_id
 
@@ -234,13 +239,13 @@ def _reconstruct_price(price_ticks: int, price_type: int) -> float | int | Decim
         raise ValueError(f"price ticks must be strictly positive (> 0), got {price_ticks}")
 
     if price_type == PRICE_TYPE_FLOAT:
-        return float(price_ticks) / PRICE_SCALE
+        return price_ticks / PRICE_SCALE
     if price_type == PRICE_TYPE_INT:
         if price_ticks % PRICE_SCALE == 0:
             return price_ticks // PRICE_SCALE
-        return float(price_ticks) / PRICE_SCALE
+        return price_ticks / PRICE_SCALE
     if price_type == PRICE_TYPE_DECIMAL:
-        return Decimal(price_ticks) / Decimal(PRICE_SCALE)
+        return Decimal(price_ticks) / _DECIMAL_PRICE_SCALE
     raise ValueError(f"Unknown price type code: {price_type}")
 
 
@@ -364,6 +369,9 @@ def _reconstruct_order(
 ) -> Order:
     """Validate unpacked fields and reconstruct an Order instance.
 
+    Validates all binary protocol constraints and instantiates the Order without
+    redundant post-init re-validation.
+
     Args:
         ts: Nanosecond timestamp.
         raw_id: Fixed 32-byte order ID field.
@@ -385,8 +393,30 @@ def _reconstruct_order(
         raise ValueError(f"Decoded timestamp must be strictly positive (> 0), got {ts}")
 
     order_id = _decode_order_id(raw_id)
-    side = _decode_side(side_code)
-    price = _reconstruct_price(price_ticks, price_type)
+
+    if side_code == SIDE_BUY_CODE:
+        side = OrderSide.BUY
+    elif side_code == SIDE_SELL_CODE:
+        side = OrderSide.SELL
+    else:
+        raise ValueError(
+            f"Unknown side code: {side_code}. Expected {SIDE_BUY_CODE} (BUY) or {SIDE_SELL_CODE} (SELL)."
+        )
+
+    if price_ticks <= 0:
+        raise ValueError(f"price ticks must be strictly positive (> 0), got {price_ticks}")
+
+    if price_type == PRICE_TYPE_FLOAT:
+        price = price_ticks / PRICE_SCALE
+    elif price_type == PRICE_TYPE_INT:
+        if price_ticks % PRICE_SCALE == 0:
+            price = price_ticks // PRICE_SCALE
+        else:
+            price = price_ticks / PRICE_SCALE
+    elif price_type == PRICE_TYPE_DECIMAL:
+        price = Decimal(price_ticks) / _DECIMAL_PRICE_SCALE
+    else:
+        raise ValueError(f"Unknown price type code: {price_type}")
 
     if qty <= 0:
         raise ValueError(f"Decoded quantity must be strictly positive (> 0), got {qty}")
@@ -398,14 +428,14 @@ def _reconstruct_order(
     else:
         raise ValueError(f"Invalid has_sequence_number flag: {has_seq}")
 
-    return Order(
-        order_id=order_id,
-        side=side,
-        price=price,
-        quantity=qty,
-        timestamp=ts,
-        sequence_number=seq,
-    )
+    instance = _ORDER_NEW(Order)
+    instance.order_id = order_id
+    instance.side = side
+    instance.price = price
+    instance.quantity = qty
+    instance.timestamp = ts
+    instance.sequence_number = seq
+    return instance
 
 
 def encode_order(order: Order) -> bytes:
@@ -506,7 +536,7 @@ def decode_order_from(
             raise TypeError(f"Expected bytes-like object, got {type(buffer).__name__}")
 
     # 2. Validate offset and bounds
-    if isinstance(offset, bool) or not isinstance(offset, int):
+    if type(offset) is not int:
         raise TypeError(f"offset must be an integer, got {type(offset).__name__}")
     if offset < 0 or offset + ORDER_STRUCT_SIZE > buf_len:
         raise ValueError(
@@ -515,7 +545,7 @@ def decode_order_from(
 
     # 3. Unpack directly from buffer at offset (in-place zero-copy read)
     try:
-        raw_fields = ORDER_STRUCT.unpack_from(buffer, offset)
+        raw_fields = _ORDER_STRUCT_UNPACK_FROM(buffer, offset)
     except struct.error as e:
         raise ValueError(f"Malformed binary order data: {e}") from e
 
@@ -549,5 +579,10 @@ def decode_order(data: bytes | bytearray | memoryview | mmap.mmap | Any) -> Orde
             f"Expected binary order data of length {ORDER_STRUCT_SIZE} bytes, got {data_len} bytes"
         )
 
-    return decode_order_from(data, 0)
+    try:
+        raw_fields = _ORDER_STRUCT_UNPACK_FROM(data, 0)
+    except struct.error as e:
+        raise ValueError(f"Malformed binary order data: {e}") from e
+
+    return _reconstruct_order(*raw_fields)
 

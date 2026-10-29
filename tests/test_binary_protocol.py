@@ -632,3 +632,151 @@ class TestBufferAndMemoryViewOperations:
         with pytest.raises(ValueError, match="Unknown side code: 99"):
             decode_order_from(buf, offset=30)
 
+
+class TestOptimizedBinaryOrderDecoding:
+    """Comprehensive test suite for the optimized binary order decoding path.
+
+    Validates:
+    - Object construction bypassing __post_init__ while preserving slot attributes and properties.
+    - Strict rejection of corrupted/malformed binary records (side, price_type, price, qty, ts, seq, id).
+    - Round-trip fidelity across float, integer, and Decimal prices.
+    - Matching engine execution equivalence between direct and decoded orders.
+    """
+
+    def test_unvalidated_order_creation_equivalence(self) -> None:
+        """Verify Order._create_unvalidated produces instances equivalent to standard constructor."""
+        standard = Order("ord-std", OrderSide.BUY, 125.50, 50, 1_700_000_000, 42)
+        unvalidated = Order._create_unvalidated("ord-std", OrderSide.BUY, 125.50, 50, 1_700_000_000, 42)
+
+        assert standard == unvalidated
+        assert repr(standard) == repr(unvalidated)
+        assert standard.order_id == unvalidated.order_id
+        assert standard.side == unvalidated.side
+        assert standard.price == unvalidated.price
+        assert standard.quantity == unvalidated.quantity
+        assert standard.timestamp == unvalidated.timestamp
+        assert standard.sequence_number == unvalidated.sequence_number
+        assert unvalidated.is_buy is True
+        assert unvalidated.is_sell is False
+
+    def test_round_trip_all_numeric_types_and_sequence_modes(self) -> None:
+        """Verify optimized decoding preserves exact types and values across float, int, Decimal, None/int seq."""
+        orders = [
+            Order("float-ord", OrderSide.BUY, 150.75, 100, 1_000_000_001, 1),
+            Order("int-ord", OrderSide.SELL, 200, 250, 1_000_000_002, None),
+            Order("dec-ord", OrderSide.BUY, Decimal("99.12345678"), 10, 1_000_000_003, 999),
+        ]
+        for order in orders:
+            data = encode_order(order)
+            decoded = decode_order(data)
+            assert decoded == order
+            assert type(decoded.price) is type(order.price)
+            assert decoded.price == order.price
+            assert decoded.sequence_number == order.sequence_number
+            assert decoded.is_buy == order.is_buy
+            assert decoded.is_sell == order.is_sell
+
+    @pytest.mark.parametrize("corrupt_side", [0, 3, 4, 255])
+    def test_optimized_decoding_rejects_corrupted_side_codes(self, corrupt_side: int) -> None:
+        """Verify side codes other than 1 or 2 are rejected during optimized decoding."""
+        valid_bytes = bytearray(encode_order(Order("ord-side", OrderSide.BUY, 100.0, 10)))
+        valid_bytes[52] = corrupt_side
+        with pytest.raises(ValueError, match="Unknown side code"):
+            decode_order(bytes(valid_bytes))
+
+    @pytest.mark.parametrize("corrupt_ptype", [0, 4, 5, 99, 255])
+    def test_optimized_decoding_rejects_corrupted_price_types(self, corrupt_ptype: int) -> None:
+        """Verify price_type codes other than 1, 2, or 3 are rejected during optimized decoding."""
+        valid_bytes = bytearray(encode_order(Order("ord-ptype", OrderSide.BUY, 100.0, 10)))
+        valid_bytes[53] = corrupt_ptype
+        with pytest.raises(ValueError, match="Unknown price type code"):
+            decode_order(bytes(valid_bytes))
+
+    @pytest.mark.parametrize("corrupt_has_seq", [2, 3, 255])
+    def test_optimized_decoding_rejects_corrupted_has_seq_flags(self, corrupt_has_seq: int) -> None:
+        """Verify has_sequence_number values other than 0 or 1 are rejected."""
+        valid_bytes = bytearray(encode_order(Order("ord-seq", OrderSide.BUY, 100.0, 10)))
+        valid_bytes[54] = corrupt_has_seq
+        with pytest.raises(ValueError, match="Invalid has_sequence_number flag"):
+            decode_order(bytes(valid_bytes))
+
+    def test_optimized_decoding_rejects_zero_and_negative_price_ticks(self) -> None:
+        """Verify zero and negative price ticks raise ValueError."""
+        valid_bytes = bytearray(encode_order(Order("ord-price", OrderSide.BUY, 100.0, 10)))
+        # Set price_ticks to 0
+        valid_bytes[40:48] = struct.pack("<q", 0)
+        with pytest.raises(ValueError, match="price ticks must be strictly positive"):
+            decode_order(bytes(valid_bytes))
+
+        # Set price_ticks to negative
+        valid_bytes[40:48] = struct.pack("<q", -500000000)
+        with pytest.raises(ValueError, match="price ticks must be strictly positive"):
+            decode_order(bytes(valid_bytes))
+
+    def test_optimized_decoding_rejects_zero_timestamp_and_quantity(self) -> None:
+        """Verify zero timestamp or zero quantity are strictly rejected."""
+        valid_bytes = bytearray(encode_order(Order("ord-test", OrderSide.BUY, 100.0, 10)))
+
+        # Zero timestamp
+        ts_zero = bytearray(valid_bytes)
+        ts_zero[0:8] = struct.pack("<Q", 0)
+        with pytest.raises(ValueError, match="Decoded timestamp must be strictly positive"):
+            decode_order(bytes(ts_zero))
+
+        # Zero quantity
+        qty_zero = bytearray(valid_bytes)
+        qty_zero[48:52] = struct.pack("<I", 0)
+        with pytest.raises(ValueError, match="Decoded quantity must be strictly positive"):
+            decode_order(bytes(qty_zero))
+
+    def test_optimized_decoding_rejects_empty_and_whitespace_order_id(self) -> None:
+        """Verify empty and whitespace-only order IDs raise ValueError."""
+        valid_bytes = bytearray(encode_order(Order("ord-id", OrderSide.BUY, 100.0, 10)))
+
+        # All null bytes (empty order_id)
+        empty_id = bytearray(valid_bytes)
+        empty_id[8:40] = b"\x00" * 32
+        with pytest.raises(ValueError, match="Decoded order_id cannot be empty"):
+            decode_order(bytes(empty_id))
+
+        # Whitespace-only order_id
+        ws_id = bytearray(valid_bytes)
+        ws_id[8:40] = b"    " + b"\x00" * 28
+        with pytest.raises(ValueError, match="Decoded order_id cannot be whitespace only"):
+            decode_order(bytes(ws_id))
+
+    def test_matching_equivalence_between_direct_and_decoded_orders(self) -> None:
+        """Verify matching engine execution yields identical trades between direct and decoded orders."""
+        from chronosmatch.matching_engine import MatchingEngine
+
+        engine_direct = MatchingEngine()
+        engine_decoded = MatchingEngine()
+
+        orders = [
+            Order("M-1", OrderSide.SELL, 105.0, 50, 1_000_000_000, 1),
+            Order("M-2", OrderSide.SELL, 106.0, 40, 1_000_000_001, 2),
+            Order("T-1", OrderSide.BUY, 106.5, 60, 1_000_000_002, 3),
+            Order("T-2", OrderSide.BUY, 104.0, 20, 1_000_000_003, 4),
+        ]
+
+        buf = bytearray(64 * len(orders))
+        for idx, o in enumerate(orders):
+            encode_order_into(o, buf, offset=idx * 64)
+
+        for idx, direct_order in enumerate(orders):
+            decoded_order = decode_order_from(buf, offset=idx * 64)
+            assert decoded_order == direct_order
+
+            trades_direct = engine_direct.process_order(direct_order)
+            trades_decoded = engine_decoded.process_order(decoded_order)
+
+            assert len(trades_direct) == len(trades_decoded)
+            for td, tc in zip(trades_direct, trades_decoded):
+                assert td.price == tc.price
+                assert td.quantity == tc.quantity
+                assert td.resting_order_id == tc.resting_order_id
+                assert td.incoming_order_id == tc.incoming_order_id
+
+        assert engine_direct.best_ask == engine_decoded.best_ask
+        assert engine_direct.best_bid == engine_decoded.best_bid
+

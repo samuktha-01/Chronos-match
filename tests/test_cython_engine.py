@@ -37,7 +37,7 @@ from chronosmatch.dashboard.metrics import (
 )
 from chronosmatch.dashboard.pipeline_runner import LatencyInstrumentedEngine, PipelineDashboardRunner
 from chronosmatch.dashboard.terminal import TerminalDashboard
-from chronosmatch.pipeline import create_pipeline
+from chronosmatch.pipeline import TradingPipeline, create_pipeline
 
 
 # ==============================================================================
@@ -650,6 +650,57 @@ class TestPipelineEngineSelection:
             assert pipeline.best_bid == ref_engine.best_bid is None
         finally:
             pipeline.cleanup()
+
+    def test_pipeline_constructor_and_factory_engine_consistency(self) -> None:
+        """Verify TradingPipeline constructor and create_pipeline factory select engines consistently."""
+        from chronosmatch.pipeline import TradingPipeline
+
+        pipeline_ctor = TradingPipeline(capacity=64)
+        pipeline_factory = create_pipeline(capacity=64)
+        try:
+            assert type(pipeline_ctor.engine) is type(pipeline_factory.engine)
+            assert pipeline_ctor.is_cython_accelerated == pipeline_factory.is_cython_accelerated
+        finally:
+            pipeline_ctor.cleanup()
+            pipeline_factory.cleanup()
+
+    def test_default_pipeline_cancellation_and_persistence_recovery(self, tmp_path: Path) -> None:
+        """Verify cancellation, WAL persistence, and recovery succeed under default engine selection."""
+        from chronosmatch.persistence import WriteAheadLog, DurabilityPolicy
+
+        wal_file = tmp_path / "default_engine_test.wal"
+        pipeline = create_pipeline(capacity=64, wal_path=wal_file, durability_policy=DurabilityPolicy.FLUSH_ON_WRITE)
+        try:
+            # 1. Place resting maker order
+            maker = Order("M-REC-1", OrderSide.SELL, 120.0, 40, 1_000_000_000, 1)
+            pipeline.process_order(maker)
+            assert pipeline.best_ask == 120.0
+
+            # 2. Cancel order through pipeline
+            cancelled = pipeline.cancel_order("M-REC-1")
+            assert cancelled.order_id == "M-REC-1"
+            assert pipeline.best_ask is None
+            assert pipeline.metrics.orders_cancelled == 1
+
+            # 3. Match another pair to create trade events in WAL
+            o1 = Order("M-REC-2", OrderSide.BUY, 110.0, 25, 2_000_000_000, 2)
+            o2 = Order("T-REC-2", OrderSide.SELL, 110.0, 25, 3_000_000_000, 3)
+            pipeline.process_order(o1)
+            trades = pipeline.process_order(o2)
+            assert len(trades) == 1
+            assert pipeline.metrics.trades_executed == 1
+        finally:
+            pipeline.close()
+
+        # 4. Recover pipeline from WAL log
+        recovered_pipeline = TradingPipeline.recover(wal_path=wal_file, capacity=64)
+        try:
+            assert len(recovered_pipeline.trades) == 1
+            assert recovered_pipeline.trades[0].quantity == 25
+            assert recovered_pipeline.best_ask is None
+            assert recovered_pipeline.best_bid is None
+        finally:
+            recovered_pipeline.close()
 
     def test_dashboard_reports_correct_acceleration_under_default_pipeline(self) -> None:
         """Verify dashboard runner accurately reflects default pipeline engine acceleration."""
