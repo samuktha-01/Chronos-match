@@ -23,6 +23,12 @@ import random
 import time
 from typing import Any, Self
 
+from chronosmatch.binary_protocol import (
+    PRICE_SCALE,
+    PRICE_TYPE_FLOAT,
+    SIDE_BUY_CODE,
+    SIDE_SELL_CODE,
+)
 from chronosmatch.models import Order, OrderSide
 from chronosmatch.producer_consumer import OrderProducer
 from chronosmatch.ring_buffer import (
@@ -483,6 +489,7 @@ class MarketSimulator:
         self._quantity_steps: int = (
             (self.config.max_quantity - self.config.min_quantity) // self.config.quantity_step
         )
+        self._order_prefix_bytes: bytes = self.config.order_prefix.encode("ascii")
 
     # --------------------------------------------------------------------------
     # Lifecycle & State Control
@@ -538,11 +545,11 @@ class MarketSimulator:
         delta = self._rng.gauss(0.0, self._volatility_factor)
         self._current_mid_price = self._quantize_price(self._current_mid_price + delta)
 
-    def next_order(self) -> Order:
-        """Synthesize and return the next valid Order according to market rules.
+    def _generate_order_fields(self) -> tuple[int, bytes, str, int, int, int, bool]:
+        """Synthesize simulated order field primitives without dataclass allocation.
 
         Returns:
-            A strictly validated Order instance.
+            Tuple of (timestamp, raw_id_bytes, order_id_str, price_ticks, quantity, side_code, is_crossing).
         """
         self._update_mid_price()
 
@@ -579,17 +586,13 @@ class MarketSimulator:
         quantity = self.config.min_quantity + step_idx * self.config.quantity_step
 
         self._sequence_number += 1
-        order_id = f"{self.config.order_prefix}_{self._sequence_number:010d}"
-        side = OrderSide.BUY if is_buy else OrderSide.SELL
+        seq = self._sequence_number
+        raw_id = b"%b_%010d" % (self._order_prefix_bytes, seq)
+        order_id = raw_id.decode("ascii")
 
-        order = Order(
-            order_id=order_id,
-            side=side,
-            price=price,
-            quantity=quantity,
-            timestamp=time.perf_counter_ns(),
-            sequence_number=self._sequence_number,
-        )
+        side_code = SIDE_BUY_CODE if is_buy else SIDE_SELL_CODE
+        price_ticks = int(round(price * PRICE_SCALE))
+        ts = time.perf_counter_ns()
 
         if not is_crossing:
             self._resting_order_pool.append(order_id)
@@ -600,7 +603,25 @@ class MarketSimulator:
         else:
             self.metrics.sell_orders += 1
 
-        return order
+        return ts, raw_id, order_id, price_ticks, quantity, side_code, is_crossing
+
+    def next_order(self) -> Order:
+        """Synthesize and return the next valid Order according to market rules.
+
+        Returns:
+            A strictly validated Order instance.
+        """
+        ts, raw_id, order_id, price_ticks, quantity, side_code, _ = self._generate_order_fields()
+        side = OrderSide.BUY if side_code == SIDE_BUY_CODE else OrderSide.SELL
+        price = price_ticks / PRICE_SCALE
+        return Order._create_unvalidated(
+            order_id=order_id,
+            side=side,
+            price=price,
+            quantity=quantity,
+            timestamp=ts,
+            sequence_number=self._sequence_number,
+        )
 
     def next_cancel(self) -> OrderCancel | None:
         """Synthesize a cancellation for an existing resting order, if available.
@@ -711,6 +732,93 @@ class MarketSimulator:
                         raise RingBufferClosedError("OrderProducer closed during backpressure wait")
                 self.metrics.total_backpressure_wait_seconds += time.monotonic() - wait_start
 
+    async def publish_order_fields(
+        self,
+        producer: OrderProducer,
+        timestamp: int,
+        raw_id: bytes | str,
+        price_ticks: int,
+        quantity: int,
+        side_code: int | OrderSide | str,
+        price_type: int = PRICE_TYPE_FLOAT,
+        has_seq: int = 1,
+        flags: int = 0,
+        seq_num: int = 0,
+    ) -> bool:
+        """Publish raw order fields directly to an OrderProducer while respecting backpressure.
+
+        Args:
+            producer: Target OrderProducer backed by a ring buffer.
+            timestamp: Nanosecond timestamp.
+            raw_id: Order identifier as bytes or str.
+            price_ticks: Scaled price ticks integer.
+            quantity: Integer quantity.
+            side_code: OrderSide or integer code (1=BUY, 2=SELL).
+            price_type: Price type code.
+            has_seq: Flag indicating if seq_num is set.
+            flags: Protocol flags.
+            seq_num: Sequence number integer.
+
+        Returns:
+            True if published successfully, False if dropped or stopped.
+
+        Raises:
+            RingBufferClosedError: If producer is closed.
+            RingBufferFullError: If backpressure mode is RAISE and buffer is full.
+            BackpressureTimeoutError: If backpressure wait timeout expires.
+        """
+        if producer.is_closed:
+            raise RingBufferClosedError("Cannot publish to closed OrderProducer")
+
+        mode = self.config.backpressure_mode
+
+        while True:
+            if self._stop_event.is_set():
+                return False
+
+            try:
+                producer.publish_order_fields_nowait(
+                    timestamp,
+                    raw_id,
+                    price_ticks,
+                    quantity,
+                    side_code,
+                    price_type,
+                    has_seq,
+                    flags,
+                    seq_num,
+                )
+                self.metrics.orders_published += 1
+                return True
+            except RingBufferFullError:
+                self.metrics.backpressure_events += 1
+
+                if mode == BackpressureMode.DROP:
+                    self.metrics.orders_dropped += 1
+                    return False
+
+                if mode == BackpressureMode.RAISE:
+                    raise RingBufferFullError(
+                        f"Downstream ring buffer is full (capacity={producer.capacity})"
+                    )
+
+                # WAIT mode: asynchronous backpressure poll
+                wait_start = time.monotonic()
+                timeout = self.config.backpressure_timeout
+                while producer.is_full:
+                    if self._stop_event.is_set():
+                        return False
+                    if timeout is not None and (time.monotonic() - wait_start) >= timeout:
+                        raise BackpressureTimeoutError(
+                            f"Backpressure timeout of {timeout}s exceeded waiting for ring buffer space"
+                        )
+                    await asyncio.sleep(self.config.backpressure_poll_interval)
+                    if producer.is_closed:
+                        raise RingBufferClosedError("OrderProducer closed during backpressure wait")
+                self.metrics.total_backpressure_wait_seconds += time.monotonic() - wait_start
+
+    publish_fields = publish_order_fields
+
     # --------------------------------------------------------------------------
     # Async Generators
     # --------------------------------------------------------------------------
@@ -787,6 +895,8 @@ class MarketSimulator:
         cancel_callback: Callable[[str], Any] | None = None,
         order_callback: Callable[[Order], Any] | None = None,
         publish_callback: Callable[[Order], Any] | None = None,
+        order_fields_callback: Callable[[], Any] | None = None,
+        publish_fields_callback: Callable[[str, int], Any] | None = None,
     ) -> SimulatorMetrics:
         """Run the market simulation loop until total_orders reached or stopped.
 
@@ -797,6 +907,8 @@ class MarketSimulator:
             cancel_callback: Optional callable invoked with order_id on cancellation.
             order_callback: Optional callable invoked with Order immediately upon generation.
             publish_callback: Optional callable invoked with Order immediately upon successful publication.
+            order_fields_callback: Optional callback invoked immediately upon order generation without Order allocation.
+            publish_fields_callback: Optional callback invoked with (order_id, timestamp) upon successful publication.
 
         Returns:
             Populated SimulatorMetrics.
@@ -836,23 +948,117 @@ class MarketSimulator:
                         continue
 
                 # Generate new order
-                order = self.next_order()
+                ts, raw_id, order_id, price_ticks, quantity, side_code, is_crossing = (
+                    self._generate_order_fields()
+                )
                 count += 1
+
+                if order_fields_callback is not None:
+                    try:
+                        order_fields_callback()
+                    except Exception:
+                        pass
+
+                order: Order | None = None
                 if order_callback is not None:
+                    order = Order._create_unvalidated(
+                        order_id=order_id,
+                        side=OrderSide.BUY if side_code == SIDE_BUY_CODE else OrderSide.SELL,
+                        price=price_ticks / PRICE_SCALE,
+                        quantity=quantity,
+                        timestamp=ts,
+                        sequence_number=self._sequence_number,
+                    )
                     try:
                         order_callback(order)
                     except Exception:
                         pass
 
                 if producer is not None:
-                    published = await self.publish_order(order, producer)
-                    if published and publish_callback is not None:
+                    if publish_callback is not None or not hasattr(producer, "publish_order_fields_nowait"):
+                        if order is None:
+                            order = Order._create_unvalidated(
+                                order_id=order_id,
+                                side=OrderSide.BUY if side_code == SIDE_BUY_CODE else OrderSide.SELL,
+                                price=price_ticks / PRICE_SCALE,
+                                quantity=quantity,
+                                timestamp=ts,
+                                sequence_number=self._sequence_number,
+                            )
                         try:
-                            publish_callback(order)
-                        except Exception:
-                            pass
+                            producer.publish_nowait(order)
+                            self.metrics.orders_published += 1
+                            if publish_callback is not None:
+                                try:
+                                    publish_callback(order)
+                                except Exception:
+                                    pass
+                            if publish_fields_callback is not None:
+                                try:
+                                    publish_fields_callback(order_id, ts)
+                                except Exception:
+                                    pass
+                        except RingBufferFullError:
+                            published = await self.publish_order(order, producer)
+                            if published:
+                                if publish_callback is not None:
+                                    try:
+                                        publish_callback(order)
+                                    except Exception:
+                                        pass
+                                if publish_fields_callback is not None:
+                                    try:
+                                        publish_fields_callback(order_id, ts)
+                                    except Exception:
+                                        pass
+                    else:
+                        try:
+                            producer.publish_order_fields_nowait(
+                                ts,
+                                raw_id,
+                                price_ticks,
+                                quantity,
+                                side_code,
+                                PRICE_TYPE_FLOAT,
+                                1,
+                                0,
+                                self._sequence_number,
+                            )
+                            self.metrics.orders_published += 1
+                            if publish_fields_callback is not None:
+                                try:
+                                    publish_fields_callback(order_id, ts)
+                                except Exception:
+                                    pass
+                        except RingBufferFullError:
+                            published = await self.publish_order_fields(
+                                producer,
+                                ts,
+                                raw_id,
+                                price_ticks,
+                                quantity,
+                                side_code,
+                                PRICE_TYPE_FLOAT,
+                                1,
+                                0,
+                                self._sequence_number,
+                            )
+                            if published and publish_fields_callback is not None:
+                                try:
+                                    publish_fields_callback(order_id, ts)
+                                except Exception:
+                                    pass
 
                 if target_engine is not None:
+                    if order is None:
+                        order = Order._create_unvalidated(
+                            order_id=order_id,
+                            side=OrderSide.BUY if side_code == SIDE_BUY_CODE else OrderSide.SELL,
+                            price=price_ticks / PRICE_SCALE,
+                            quantity=quantity,
+                            timestamp=ts,
+                            sequence_number=self._sequence_number,
+                        )
                     if hasattr(target_engine, "process_order"):
                         target_engine.process_order(order)
                     elif hasattr(target_engine, "add_order"):

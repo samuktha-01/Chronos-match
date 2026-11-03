@@ -48,15 +48,25 @@ import time
 from typing import Any, Iterator, Self
 
 from chronosmatch.binary_protocol import (
+    INT64_MAX,
+    MAX_ORDER_ID_LENGTH,
     ORDER_STRUCT,
     ORDER_STRUCT_SIZE,
+    PRICE_TYPE_DECIMAL,
+    PRICE_TYPE_FLOAT,
+    PRICE_TYPE_INT,
+    SIDE_BUY_CODE,
+    SIDE_SELL_CODE,
+    UINT32_MAX,
+    UINT64_MAX as PROTO_UINT64_MAX,
+    _ORDER_STRUCT_PACK_INTO,
     _validate_order_fields,
     decode_order,
     decode_order_from,
     encode_order,
     encode_order_into,
 )
-from chronosmatch.models import Order
+from chronosmatch.models import Order, OrderSide
 from chronosmatch.shared_memory import (
     MalformedRecordError,
     SharedMemoryClosedError,
@@ -500,7 +510,17 @@ class RingBuffer:
                 raise SharedMemoryRecordSizeError(
                     f"Record size mismatch: expected {self._record_size} bytes, got {ORDER_STRUCT_SIZE} bytes"
                 )
-            order_fields = _validate_order_fields(item)
+            (
+                ts,
+                raw_id,
+                price_ticks,
+                qty,
+                side_code,
+                price_type,
+                has_seq,
+                flags,
+                seq_num,
+            ) = _validate_order_fields(item)
         elif isinstance(item, (bytes, bytearray, memoryview)):
             if len(item) != self._record_size:
                 raise SharedMemoryRecordSizeError(
@@ -546,7 +566,19 @@ class RingBuffer:
 
             # Step 1: Write record payload into slot (data written BEFORE head update)
             if is_order:
-                ORDER_STRUCT.pack_into(self._region.mmap, slot_offset, *order_fields)
+                _ORDER_STRUCT_PACK_INTO(
+                    self._region.mmap,
+                    slot_offset,
+                    ts,
+                    raw_id,
+                    price_ticks,
+                    qty,
+                    side_code,
+                    price_type,
+                    has_seq,
+                    flags,
+                    seq_num,
+                )
             else:
                 self._region.write_record(slot_offset, item, record_size=self._record_size)
 
@@ -557,6 +589,232 @@ class RingBuffer:
 
             # Step 3: Notify waiting consumers
             self._not_empty.notify()
+
+    def put_order_fields(
+        self,
+        timestamp: int,
+        raw_id: bytes | str,
+        price_ticks: int,
+        quantity: int,
+        side_code: int | OrderSide | str,
+        price_type: int = PRICE_TYPE_FLOAT,
+        has_seq: int = 1,
+        flags: int = 0,
+        seq_num: int = 0,
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> None:
+        """Publish order fields directly into the ring buffer without intermediate object allocations.
+
+        Serializes directly into the shared-memory mmap slot using struct.pack_into.
+        Guarantees strict cache-line alignment and single-producer single-consumer ordering.
+
+        Args:
+            timestamp: Nanosecond timestamp (uint64 > 0).
+            raw_id: Order identifier as bytes (length <= 32) or str.
+            price_ticks: Integer scaled price ticks (int64 > 0).
+            quantity: Integer quantity (uint32 > 0).
+            side_code: 1 for BUY, 2 for SELL (or OrderSide / 'BUY' / 'SELL').
+            price_type: Price type indicator (1=float, 2=int, 3=Decimal).
+            has_seq: 1 if sequence number present, 0 if None.
+            flags: Reserved flags byte (default 0).
+            seq_num: Unsigned 64-bit sequence number (default 0).
+            block: If True, blocks on full buffer until timeout.
+            timeout: Maximum seconds to wait (None for indefinite).
+
+        Raises:
+            RingBufferClosedError: If buffer is closed.
+            SharedMemoryReadOnlyError: If buffer is read-only.
+            SharedMemoryRecordSizeError: If buffer record size is not 64 bytes.
+            RingBufferFullError: If buffer is full and non-blocking or timeout expires.
+            TypeError: If argument types are invalid.
+            ValueError: If argument values violate protocol boundaries.
+        """
+        self._check_closed()
+        if self._read_only:
+            raise SharedMemoryReadOnlyError("Cannot write to a read-only ring buffer")
+        if self._record_size != ORDER_STRUCT_SIZE:
+            raise SharedMemoryRecordSizeError(
+                f"Record size mismatch: expected {self._record_size} bytes, got {ORDER_STRUCT_SIZE} bytes"
+            )
+
+        # Validate arguments strictly with fast-path execution
+        if type(timestamp) is int and 0 < timestamp <= PROTO_UINT64_MAX:
+            pass
+        elif isinstance(timestamp, bool) or not isinstance(timestamp, int):
+            raise TypeError(f"timestamp must be an integer, got {type(timestamp).__name__}")
+        elif timestamp <= 0:
+            raise ValueError(f"timestamp must be strictly positive (> 0), got {timestamp}")
+        else:
+            raise ValueError(f"timestamp {timestamp} exceeds uint64 maximum")
+
+        if type(raw_id) is bytes:
+            raw_id_bytes = raw_id
+            if not raw_id_bytes or raw_id_bytes.isspace():
+                raise ValueError("order_id cannot be empty or whitespace")
+            if len(raw_id_bytes) > MAX_ORDER_ID_LENGTH:
+                raise ValueError(
+                    f"order_id length ({len(raw_id_bytes)} bytes) exceeds maximum of {MAX_ORDER_ID_LENGTH} bytes"
+                )
+            if b"\x00" in raw_id_bytes:
+                clean_id = raw_id_bytes.rstrip(b"\x00")
+                if not clean_id or clean_id.isspace():
+                    raise ValueError("order_id cannot be empty or whitespace")
+                if b"\x00" in clean_id:
+                    raise ValueError("order_id cannot contain null bytes")
+        elif isinstance(raw_id, str):
+            if not raw_id.strip():
+                raise ValueError("order_id cannot be empty or whitespace")
+            raw_id_bytes = raw_id.encode("utf-8")
+            if len(raw_id_bytes) > MAX_ORDER_ID_LENGTH:
+                raise ValueError(
+                    f"order_id length ({len(raw_id_bytes)} bytes) exceeds maximum of {MAX_ORDER_ID_LENGTH} bytes"
+                )
+            if "\x00" in raw_id:
+                raise ValueError("order_id cannot contain null bytes")
+        elif isinstance(raw_id, (bytearray, memoryview)):
+            raw_id_bytes = bytes(raw_id)
+            if not raw_id_bytes or raw_id_bytes.isspace():
+                raise ValueError("order_id cannot be empty or whitespace")
+            if len(raw_id_bytes) > MAX_ORDER_ID_LENGTH:
+                raise ValueError(
+                    f"order_id length ({len(raw_id_bytes)} bytes) exceeds maximum of {MAX_ORDER_ID_LENGTH} bytes"
+                )
+            if b"\x00" in raw_id_bytes:
+                clean_id = raw_id_bytes.rstrip(b"\x00")
+                if not clean_id or clean_id.isspace():
+                    raise ValueError("order_id cannot be empty or whitespace")
+                if b"\x00" in clean_id:
+                    raise ValueError("order_id cannot contain null bytes")
+        else:
+            raise TypeError(f"raw_id must be bytes or str, got {type(raw_id).__name__}")
+
+        if type(price_ticks) is int and 0 < price_ticks <= INT64_MAX:
+            pass
+        elif isinstance(price_ticks, bool) or not isinstance(price_ticks, int):
+            raise TypeError(f"price_ticks must be an integer, got {type(price_ticks).__name__}")
+        elif price_ticks <= 0:
+            raise ValueError(f"price ticks must be strictly positive (> 0), got {price_ticks}")
+        else:
+            raise ValueError("price ticks exceeds int64 maximum")
+
+        if type(quantity) is int and 0 < quantity <= UINT32_MAX:
+            pass
+        elif isinstance(quantity, bool) or not isinstance(quantity, int):
+            raise TypeError(f"quantity must be an integer, got {type(quantity).__name__}")
+        elif quantity <= 0:
+            raise ValueError(f"quantity must be strictly positive (> 0), got {quantity}")
+        else:
+            raise ValueError("quantity exceeds uint32 maximum")
+
+        if side_code == SIDE_BUY_CODE:
+            resolved_side = SIDE_BUY_CODE
+        elif side_code == SIDE_SELL_CODE:
+            resolved_side = SIDE_SELL_CODE
+        elif side_code == OrderSide.BUY or side_code == "BUY":
+            resolved_side = SIDE_BUY_CODE
+        elif side_code == OrderSide.SELL or side_code == "SELL":
+            resolved_side = SIDE_SELL_CODE
+        else:
+            raise ValueError(f"Unknown side code: {side_code}")
+
+        if price_type == PRICE_TYPE_FLOAT:
+            pass
+        elif price_type not in (PRICE_TYPE_INT, PRICE_TYPE_DECIMAL):
+            raise ValueError(f"Unknown price type code: {price_type}")
+
+        if has_seq == 1:
+            pass
+        elif has_seq != 0:
+            raise ValueError(f"Invalid has_sequence_number flag: {has_seq}")
+
+        if type(seq_num) is int and 0 <= seq_num <= PROTO_UINT64_MAX:
+            pass
+        else:
+            raise ValueError(f"sequence_number {seq_num} out of uint64 range")
+
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+                raise ValueError(f"timeout must be a non-negative number or None, got {timeout}")
+
+        with self._lock:
+            self._check_closed()
+            end_time = (time.monotonic() + timeout) if (block and timeout is not None) else None
+
+            head = self._cached_head
+            while True:
+                occupied = (head - self._cached_tail) & UINT64_MASK
+                if occupied < self._capacity:
+                    break
+
+                self._cached_tail = self._read_tail()
+                occupied = (head - self._cached_tail) & UINT64_MASK
+                if occupied < self._capacity:
+                    break
+
+                if not block:
+                    raise RingBufferFullError(f"Ring buffer is full (capacity={self._capacity})")
+
+                if end_time is not None:
+                    remaining = end_time - time.monotonic()
+                    if remaining <= 0:
+                        raise RingBufferFullError(
+                            f"Timeout waiting to put into ring buffer (capacity={self._capacity})"
+                        )
+                    self._not_full.wait(timeout=min(remaining, 0.005))
+                else:
+                    self._not_full.wait(timeout=0.005)
+
+                self._check_closed()
+
+            slot = self._slot_index(head)
+            slot_offset = SLOTS_OFFSET + slot * self._record_size
+
+            # In-place zero-copy direct write into mmap slot
+            _ORDER_STRUCT_PACK_INTO(
+                self._region.mmap,
+                slot_offset,
+                timestamp,
+                raw_id_bytes,
+                price_ticks,
+                quantity,
+                resolved_side,
+                price_type,
+                has_seq,
+                flags,
+                seq_num,
+            )
+
+            new_head = (head + 1) & UINT64_MASK
+            self._cached_head = new_head
+            self._write_head(new_head)
+            self._not_empty.notify()
+
+    def put_order_fields_nowait(
+        self,
+        timestamp: int,
+        raw_id: bytes | str,
+        price_ticks: int,
+        quantity: int,
+        side_code: int | OrderSide | str,
+        price_type: int = PRICE_TYPE_FLOAT,
+        has_seq: int = 1,
+        flags: int = 0,
+        seq_num: int = 0,
+    ) -> None:
+        """Put order fields directly into the ring buffer without blocking."""
+        self.put_order_fields(
+            timestamp,
+            raw_id,
+            price_ticks,
+            quantity,
+            side_code,
+            price_type,
+            has_seq,
+            flags,
+            seq_num,
+            False,
+        )
 
     def put_nowait(self, item: Order | bytes | bytearray | memoryview) -> None:
         """Put an item into the ring buffer without blocking.
@@ -1012,6 +1270,60 @@ class RingBufferProducer:
     ) -> None:
         """Put a raw binary record into the ring buffer."""
         self._ring_buffer.put_record(data, block=block, timeout=timeout)
+
+    def put_order_fields(
+        self,
+        timestamp: int,
+        raw_id: bytes | str,
+        price_ticks: int,
+        quantity: int,
+        side_code: int | OrderSide | str,
+        price_type: int = PRICE_TYPE_FLOAT,
+        has_seq: int = 1,
+        flags: int = 0,
+        seq_num: int = 0,
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> None:
+        """Publish order fields directly into the ring buffer without allocating an Order."""
+        self._ring_buffer.put_order_fields(
+            timestamp=timestamp,
+            raw_id=raw_id,
+            price_ticks=price_ticks,
+            quantity=quantity,
+            side_code=side_code,
+            price_type=price_type,
+            has_seq=has_seq,
+            flags=flags,
+            seq_num=seq_num,
+            block=block,
+            timeout=timeout,
+        )
+
+    def put_order_fields_nowait(
+        self,
+        timestamp: int,
+        raw_id: bytes | str,
+        price_ticks: int,
+        quantity: int,
+        side_code: int | OrderSide | str,
+        price_type: int = PRICE_TYPE_FLOAT,
+        has_seq: int = 1,
+        flags: int = 0,
+        seq_num: int = 0,
+    ) -> None:
+        """Publish order fields directly into the ring buffer without blocking."""
+        self._ring_buffer.put_order_fields_nowait(
+            timestamp,
+            raw_id,
+            price_ticks,
+            quantity,
+            side_code,
+            price_type,
+            has_seq,
+            flags,
+            seq_num,
+        )
 
     def flush(self) -> None:
         """Flush changes to backing storage."""

@@ -664,10 +664,10 @@ class TradingPipeline:
         base_drop = self.metrics.orders_dropped
         base_bp = self.metrics.backpressure_events
 
-        def on_order(ord: Order) -> None:
+        def on_order_generated() -> None:
             self.metrics.orders_generated += 1
 
-        def on_publish(ord: Order) -> None:
+        def on_publish_fields(order_id: str, ts: int) -> None:
             self.metrics.orders_published += 1
             if self._instrument_latency:
                 t1 = time.perf_counter_ns()
@@ -676,15 +676,15 @@ class TradingPipeline:
                         self._pending_published.pop(next(iter(self._pending_published)))
                     except Exception:
                         pass
-                self._pending_published[ord.order_id] = (getattr(ord, "timestamp", None), t1)
+                self._pending_published[order_id] = (ts, t1)
 
         async def _producer_loop() -> None:
             try:
                 await sim.run(
                     producer=self._producer,
                     cancel_callback=on_cancel,
-                    order_callback=on_order,
-                    publish_callback=on_publish,
+                    order_fields_callback=on_order_generated,
+                    publish_fields_callback=on_publish_fields,
                 )
             finally:
                 # Synchronize final simulator metrics back into pipeline metrics
