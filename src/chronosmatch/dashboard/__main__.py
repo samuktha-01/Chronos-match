@@ -133,6 +133,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Run in standalone demo mode without attached TradingPipeline",
     )
     parser.add_argument(
+        "--whale-threshold",
+        type=int,
+        default=1000,
+        help="Whale order quantity threshold (default: 1,000)",
+    )
+    parser.add_argument(
         "--wal",
         type=str,
         default=None,
@@ -230,12 +236,14 @@ def main(argv: list[str] | None = None) -> int:
         total_orders=args.orders,
         rate=args.rate,
         mode=sim_mode,
+        whale_order_threshold=args.whale_threshold,
     )
     pipeline = create_pipeline(
         config=config,
         capacity=args.capacity,
         engine=engine,
         wal_path=args.wal,
+        whale_threshold=args.whale_threshold,
     )
 
     runner = PipelineDashboardRunner(

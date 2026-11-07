@@ -32,11 +32,10 @@ from typing import Any, Callable, Self
 
 from chronosmatch.binary_protocol import (
     ORDER_STRUCT_SIZE,
-    PRICE_TYPE_FLOAT,
     decode_order,
     encode_order,
 )
-from chronosmatch.models import Order, OrderSide
+from chronosmatch.models import Order
 from chronosmatch.ring_buffer import (
     RingBuffer,
     RingBufferClosedError,
@@ -182,64 +181,6 @@ class OrderProducer:
         if not isinstance(order, Order):
             raise TypeError(f"order must be an Order instance, got {type(order).__name__}")
         self._producer.put_nowait(order)
-
-    def publish_order_fields(
-        self,
-        timestamp: int,
-        raw_id: bytes | str,
-        price_ticks: int,
-        quantity: int,
-        side_code: int | OrderSide | str,
-        price_type: int = PRICE_TYPE_FLOAT,
-        has_seq: int = 1,
-        flags: int = 0,
-        seq_num: int = 0,
-        block: bool = True,
-        timeout: float | None = None,
-    ) -> None:
-        """Publish order fields directly into the ring buffer without allocating an Order."""
-        self._producer.put_order_fields(
-            timestamp=timestamp,
-            raw_id=raw_id,
-            price_ticks=price_ticks,
-            quantity=quantity,
-            side_code=side_code,
-            price_type=price_type,
-            has_seq=has_seq,
-            flags=flags,
-            seq_num=seq_num,
-            block=block,
-            timeout=timeout,
-        )
-
-    def publish_order_fields_nowait(
-        self,
-        timestamp: int,
-        raw_id: bytes | str,
-        price_ticks: int,
-        quantity: int,
-        side_code: int | OrderSide | str,
-        price_type: int = PRICE_TYPE_FLOAT,
-        has_seq: int = 1,
-        flags: int = 0,
-        seq_num: int = 0,
-    ) -> None:
-        """Publish order fields directly into the ring buffer without blocking."""
-        self._producer.put_order_fields_nowait(
-            timestamp,
-            raw_id,
-            price_ticks,
-            quantity,
-            side_code,
-            price_type,
-            has_seq,
-            flags,
-            seq_num,
-        )
-
-    # Direct publishing convenience aliases
-    publish_fields = publish_order_fields
-    publish_fields_nowait = publish_order_fields_nowait
 
     def publish_batch(
         self,

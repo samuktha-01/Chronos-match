@@ -295,6 +295,11 @@ class DashboardMetricsSnapshot:
     queue_dwell_latency: LatencyStats | None = None
     tick_to_trade_latency: LatencyStats | None = None
     order_book_depth_levels: int | None = None
+    whale_orders_detected: int | None = None
+    whale_volume_executed: int | None = None
+    multi_level_sweeps: int | None = None
+    whale_order_threshold: int | None = None
+    last_whale_order: dict[str, Any] | None = None
     is_cython_accelerated: bool = False
     source_name: str = "ChronosMatch"
 
@@ -333,6 +338,11 @@ class DashboardMetricsSnapshot:
             "best_ask": float(self.best_ask) if self.best_ask is not None else None,
             "spread": float(self.spread) if self.spread is not None else None,
             "order_book_depth_levels": self.order_book_depth_levels,
+            "whale_orders_detected": self.whale_orders_detected,
+            "whale_volume_executed": self.whale_volume_executed,
+            "multi_level_sweeps": self.multi_level_sweeps,
+            "whale_order_threshold": self.whale_order_threshold,
+            "last_whale_order": self.last_whale_order,
             "is_cython_accelerated": self.is_cython_accelerated,
             "source_name": self.source_name,
         }
@@ -368,6 +378,7 @@ class DashboardMetricsCollector:
         core_latency_tracker: BoundedLatencyTracker | None = None,
         dwell_latency_tracker: BoundedLatencyTracker | None = None,
         tick_to_trade_tracker: BoundedLatencyTracker | None = None,
+        whale_threshold: int | None = None,
         source_name: str = "ChronosMatch",
     ) -> None:
         """Initialize DashboardMetricsCollector.
@@ -381,9 +392,11 @@ class DashboardMetricsCollector:
             core_latency_tracker: Optional BoundedLatencyTracker for core matching latency (T3 - T2).
             dwell_latency_tracker: Optional BoundedLatencyTracker for ring-buffer queue dwell latency (T2 - T1).
             tick_to_trade_tracker: Optional BoundedLatencyTracker for end-to-end tick-to-trade latency (T3 - T0).
+            whale_threshold: Optional whale order threshold for anomaly detection.
             source_name: Descriptive name for diagnostic reporting.
         """
         self.source_name = source_name
+        self.whale_threshold = whale_threshold
         self._pipeline = pipeline
         self._engine = engine
         self._ring_buffer = ring_buffer
@@ -426,6 +439,10 @@ class DashboardMetricsCollector:
         self._manual_duplicate_orders: int | None = None
         self._manual_processing_errors: int | None = None
         self._manual_backpressure_events: int | None = None
+        self._manual_whale_orders_detected: int | None = None
+        self._manual_whale_volume_executed: int | None = None
+        self._manual_multi_level_sweeps: int | None = None
+        self._manual_last_whale_order: dict[str, Any] | None = None
 
         if pipeline is not None:
             self.attach_pipeline(pipeline)
@@ -566,6 +583,38 @@ class DashboardMetricsCollector:
             current = self._manual_processing_errors or 0
             self._manual_processing_errors = current + count
 
+    def record_whale_order(
+        self,
+        quantity: int,
+        swept_levels: int = 0,
+        *,
+        order_id: str | None = None,
+        side: str | None = None,
+        price: float | None = None,
+    ) -> None:
+        """Record a whale order detection event in standalone/manual mode."""
+        with self._lock:
+            c = self._manual_whale_orders_detected or 0
+            v = self._manual_whale_volume_executed or 0
+            self._manual_whale_orders_detected = c + 1
+            self._manual_whale_volume_executed = v + quantity
+            if swept_levels > 1:
+                sw = self._manual_multi_level_sweeps or 0
+                self._manual_multi_level_sweeps = sw + 1
+            self._manual_last_whale_order = {
+                "order_id": order_id or f"WHALE-{c+1}",
+                "side": side or "BUY",
+                "price": price,
+                "quantity": quantity,
+                "swept_levels": swept_levels,
+            }
+
+    def record_multi_level_sweep(self, count: int = 1) -> None:
+        """Increment manual count of multi-level price sweeps."""
+        with self._lock:
+            current = self._manual_multi_level_sweeps or 0
+            self._manual_multi_level_sweeps = current + count
+
     # --------------------------------------------------------------------------
     # Snapshot Generation
     # --------------------------------------------------------------------------
@@ -636,6 +685,11 @@ class DashboardMetricsCollector:
 
                 is_cython = is_cython_compiled() and isinstance(self._engine, CythonMatchingEngine)
 
+            # 10. Whale Order Detection Telemetry
+            whale_detected, whale_volume, whale_sweeps, whale_thresh, last_whale = (
+                self._resolve_whale_metrics()
+            )
+
             return DashboardMetricsSnapshot(
                 timestamp_ns=now_perf_ns,
                 wall_timestamp_ns=now_wall_ns,
@@ -665,6 +719,11 @@ class DashboardMetricsCollector:
                 best_ask=best_ask,
                 spread=spread,
                 order_book_depth_levels=depth_levels,
+                whale_orders_detected=whale_detected,
+                whale_volume_executed=whale_volume,
+                multi_level_sweeps=whale_sweeps,
+                whale_order_threshold=whale_thresh,
+                last_whale_order=last_whale,
                 is_cython_accelerated=is_cython,
                 source_name=self.source_name,
             )
@@ -918,6 +977,37 @@ class DashboardMetricsCollector:
             depth_levels = b_levels + a_levels
 
         return best_bid, best_ask, spread, depth_levels
+
+    def _resolve_whale_metrics(
+        self,
+    ) -> tuple[int | None, int | None, int | None, int | None, dict[str, Any] | None]:
+        whale_detected: int | None = None
+        whale_volume: int | None = None
+        whale_sweeps: int | None = None
+        whale_thresh: int | None = self.whale_threshold
+        last_whale: dict[str, Any] | None = self._manual_last_whale_order
+
+        if self._pipeline is not None:
+            if hasattr(self._pipeline, "metrics"):
+                pm = self._pipeline.metrics
+                whale_detected = getattr(pm, "whale_orders_detected", None)
+                whale_volume = getattr(pm, "whale_volume_executed", None)
+                whale_sweeps = getattr(pm, "multi_level_sweeps", None)
+                if whale_thresh is None:
+                    whale_thresh = getattr(pm, "whale_order_threshold", None)
+            if hasattr(self._pipeline, "last_whale_order") and self._pipeline.last_whale_order is not None:
+                last_whale = self._pipeline.last_whale_order
+            if whale_thresh is None and hasattr(self._pipeline, "whale_threshold"):
+                whale_thresh = getattr(self._pipeline, "whale_threshold", None)
+
+        if whale_detected is None and self._manual_whale_orders_detected is not None:
+            whale_detected = self._manual_whale_orders_detected
+        if whale_volume is None and self._manual_whale_volume_executed is not None:
+            whale_volume = self._manual_whale_volume_executed
+        if whale_sweeps is None and self._manual_multi_level_sweeps is not None:
+            whale_sweeps = self._manual_multi_level_sweeps
+
+        return whale_detected, whale_volume, whale_sweeps, whale_thresh, last_whale
 
     @property
     def core_latency_tracker(self) -> BoundedLatencyTracker:

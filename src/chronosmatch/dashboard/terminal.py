@@ -135,6 +135,12 @@ class AnsiStyler:
     def red(self, text: str) -> str:
         return f"{self.RED}{text}{self.RESET}" if self.enabled else text
 
+    def magenta(self, text: str) -> str:
+        return f"{self.MAGENTA}{text}{self.RESET}" if self.enabled else text
+
+    def blue(self, text: str) -> str:
+        return f"{self.BLUE}{text}{self.RESET}" if self.enabled else text
+
     def gray(self, text: str) -> str:
         return f"{self.GRAY}{text}{self.RESET}" if self.enabled else text
 
@@ -801,6 +807,48 @@ class DashboardRenderer:
                 format_counter_with_alert(snapshot.backpressure_events, styler),
             )
         )
+
+        # ----------------------------------------------------------------------
+        # 7. Whale Order & Multi-Level Sweep Telemetry Alert
+        # ----------------------------------------------------------------------
+        if snapshot.whale_orders_detected is not None and snapshot.whale_orders_detected > 0:
+            lines.append(self._divider())
+            alert_label = f"(! {snapshot.whale_orders_detected:,} DETECTED !)"
+            alert_tag = styler.bold(styler.magenta(alert_label)) if styler.enabled else alert_label
+            lines.append(self._section_header("WHALE ORDER & SWEEP TELEMETRY", alert_tag))
+            lines.append(
+                self._two_col_row(
+                    "Whale Threshold",
+                    f">= {format_int(snapshot.whale_order_threshold, styler)}"
+                    if snapshot.whale_order_threshold is not None
+                    else styler.gray("N/A"),
+                    "Whale Volume",
+                    format_int(snapshot.whale_volume_executed, styler),
+                )
+            )
+            lines.append(
+                self._two_col_row(
+                    "Whale Orders",
+                    format_counter_with_alert(snapshot.whale_orders_detected, styler),
+                    "Multi-Lvl Sweeps",
+                    format_counter_with_alert(snapshot.multi_level_sweeps, styler),
+                )
+            )
+            if snapshot.last_whale_order:
+                ord_info = snapshot.last_whale_order
+                oid = str(ord_info.get("order_id", "N/A"))
+                side = str(ord_info.get("side", "N/A"))
+                qty = format_int(ord_info.get("quantity"), styler)
+                price_val = ord_info.get("price")
+                price_str = format_price(price_val, styler) if price_val is not None else "MKT"
+                swept = ord_info.get("swept_levels", 0)
+
+                last_desc = f"{side} {qty} @ {price_str} ({oid})"
+                lines.append(self._pad_row(f"  Last Whale Order:   {last_desc}"))
+                if swept > 1:
+                    sweep_text = f">>> MULTI-LEVEL SWEEP: Executed across {swept} price levels! <<<"
+                    styled_sweep = styler.bold(styler.yellow(sweep_text)) if styler.enabled else sweep_text
+                    lines.append(self._pad_row(f"  {styled_sweep}"))
 
         # ----------------------------------------------------------------------
         # Bottom Border

@@ -63,7 +63,6 @@ INT64_MIN: int = -(1 << 63)
 _ORDER_NEW = object.__new__
 _DECIMAL_PRICE_SCALE: Decimal = Decimal(PRICE_SCALE)
 _ORDER_STRUCT_UNPACK_FROM = ORDER_STRUCT.unpack_from
-_ORDER_STRUCT_PACK_INTO = ORDER_STRUCT.pack_into
 
 
 def _validate_and_encode_order_id(order_id: Any) -> bytes:
@@ -176,60 +175,51 @@ def _validate_and_scale_price(price: Any) -> tuple[int, int]:
         TypeError: If price is a bool or unsupported type.
         ValueError: If price is non-finite, <= 0, overflows int64, or loses precision.
     """
-    t = type(price)
-    if t is float:
-        if math.isnan(price) or math.isinf(price):
-            raise ValueError(f"price must be finite, got {price}")
-        if price <= 0:
-            raise ValueError(f"price must be strictly positive (> 0), got {price}")
-        ticks = round(price * PRICE_SCALE)
-        if ticks <= 0:
-            raise ValueError(f"price ticks must be strictly positive (> 0), got {ticks}")
-        if ticks > INT64_MAX:
-            raise ValueError(f"price {price} exceeds maximum allowable binary limit")
+    if isinstance(price, bool) or not isinstance(price, (int, float, Decimal)):
+        raise TypeError(f"price must be a real number (int, float, Decimal), got {type(price).__name__}")
+    if isinstance(price, float) and (math.isnan(price) or math.isinf(price)):
+        raise ValueError(f"price must be finite, got {price}")
+    if isinstance(price, Decimal) and (price.is_nan() or price.is_infinite()):
+        raise ValueError(f"price must be finite, got {price}")
+    if price <= 0:
+        raise ValueError(f"price must be strictly positive (> 0), got {price}")
 
-        # Fast check for sub-tick precision loss: only convert to Decimal if deviation is detected
-        if abs(ticks / PRICE_SCALE - price) >= 1e-9:
-            s = str(price)
-            dot_idx = s.find(".")
-            if dot_idx != -1 and (len(s) - dot_idx - 1) > 8:
-                d = Decimal(s)
-                d_ticks = d * _DECIMAL_PRICE_SCALE
-                if d_ticks != d_ticks.to_integral_value():
-                    raise ValueError(
-                        f"price {price} cannot be represented without losing precision at scale {PRICE_SCALE} "
-                        f"(maximum 8 decimal places supported)"
-                    )
-        return ticks, PRICE_TYPE_FLOAT
-
-    elif t is int:
-        if price <= 0:
-            raise ValueError(f"price must be strictly positive (> 0), got {price}")
+    if isinstance(price, int):
+        price_type = PRICE_TYPE_INT
         ticks = price * PRICE_SCALE
-        if ticks > INT64_MAX:
-            raise ValueError(f"price {price} exceeds maximum allowable binary limit")
-        return ticks, PRICE_TYPE_INT
-
-    elif t is Decimal:
-        if price.is_nan() or price.is_infinite():
-            raise ValueError(f"price must be finite, got {price}")
-        if price <= 0:
-            raise ValueError(f"price must be strictly positive (> 0), got {price}")
-        d_ticks = price * _DECIMAL_PRICE_SCALE
+    elif isinstance(price, float):
+        price_type = PRICE_TYPE_FLOAT
+        s = str(price)
+        dot_idx = s.find(".")
+        if dot_idx != -1 and (len(s) - dot_idx - 1) > 8:
+            d = Decimal(s)
+            d_ticks = d * Decimal(PRICE_SCALE)
+            if d_ticks != d_ticks.to_integral_value():
+                raise ValueError(
+                    f"price {price} cannot be represented without losing precision at scale {PRICE_SCALE} "
+                    f"(maximum 8 decimal places supported)"
+                )
+            ticks = int(d_ticks)
+        else:
+            ticks = round(price * PRICE_SCALE)
+    elif isinstance(price, Decimal):
+        price_type = PRICE_TYPE_DECIMAL
+        d_ticks = price * Decimal(PRICE_SCALE)
         if d_ticks != d_ticks.to_integral_value():
             raise ValueError(
                 f"price {price} cannot be represented without losing precision at scale {PRICE_SCALE} "
                 f"(maximum 8 decimal places supported)"
             )
         ticks = int(d_ticks)
-        if ticks <= 0:
-            raise ValueError(f"price ticks must be strictly positive (> 0), got {ticks}")
-        if ticks > INT64_MAX:
-            raise ValueError(f"price {price} exceeds maximum allowable binary limit")
-        return ticks, PRICE_TYPE_DECIMAL
-
     else:
-        raise TypeError(f"price must be a real number (int, float, Decimal), got {type(price).__name__}")
+        raise TypeError(f"Unsupported price type: {type(price).__name__}")
+
+    if ticks <= 0:
+        raise ValueError(f"price ticks must be strictly positive (> 0), got {ticks}")
+    if ticks > INT64_MAX:
+        raise ValueError(f"price {price} exceeds maximum allowable binary limit")
+
+    return ticks, price_type
 
 
 def _reconstruct_price(price_ticks: int, price_type: int) -> float | int | Decimal:
@@ -510,32 +500,10 @@ def encode_order_into(
         )
 
     # 3. Validate order fields
-    (
-        ts,
-        raw_id,
-        price_ticks,
-        qty,
-        side_code,
-        price_type,
-        has_seq,
-        flags,
-        seq_num,
-    ) = _validate_order_fields(order)
+    fields = _validate_order_fields(order)
 
     # 4. Pack directly into buffer at offset (in-place zero-copy write)
-    _ORDER_STRUCT_PACK_INTO(
-        buffer,
-        offset,
-        ts,
-        raw_id,
-        price_ticks,
-        qty,
-        side_code,
-        price_type,
-        has_seq,
-        flags,
-        seq_num,
-    )
+    ORDER_STRUCT.pack_into(buffer, offset, *fields)
 
 
 def decode_order_from(

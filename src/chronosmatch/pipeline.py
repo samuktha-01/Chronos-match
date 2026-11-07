@@ -80,6 +80,10 @@ class TradingPipelineMetrics:
     trades_executed: int = 0
     volume_executed: int = 0
     backpressure_events: int = 0
+    whale_orders_detected: int = 0
+    whale_volume_executed: int = 0
+    multi_level_sweeps: int = 0
+    whale_order_threshold: int | None = None
     start_time_ns: int | None = None
     stop_time_ns: int | None = None
     wall_start_time_ns: int | None = None
@@ -119,6 +123,10 @@ class TradingPipelineMetrics:
             "trades_executed": self.trades_executed,
             "volume_executed": self.volume_executed,
             "backpressure_events": self.backpressure_events,
+            "whale_orders_detected": self.whale_orders_detected,
+            "whale_volume_executed": self.whale_volume_executed,
+            "multi_level_sweeps": self.multi_level_sweeps,
+            "whale_order_threshold": self.whale_order_threshold,
             "elapsed_seconds": self.elapsed_seconds,
             "throughput_orders_per_sec": self.throughput_orders_per_sec,
             "start_time_ns": self.start_time_ns,
@@ -146,6 +154,9 @@ class TradingPipelineMetrics:
         self.trades_executed = 0
         self.volume_executed = 0
         self.backpressure_events = 0
+        self.whale_orders_detected = 0
+        self.whale_volume_executed = 0
+        self.multi_level_sweeps = 0
         self.start_time_ns = None
         self.stop_time_ns = None
         self.wall_start_time_ns = None
@@ -207,6 +218,8 @@ class TradingPipeline:
         strict_recovery: bool = False,
         instrument_latency: bool = False,
         latency_callback: Callable[[float | None, float | None, float | None], None] | None = None,
+        whale_threshold: int | None = None,
+        whale_callback: Callable[[Order, list[Trade], int], None] | None = None,
     ) -> None:
         """Initialize the end-to-end trading pipeline.
 
@@ -229,6 +242,17 @@ class TradingPipeline:
         self.metrics: TradingPipelineMetrics = TradingPipelineMetrics()
         self.engine: Any = engine if engine is not None else get_default_matching_engine()
         self._durability_policy = DurabilityPolicy(durability_policy)
+
+        # Whale order detection setup
+        if whale_threshold is not None:
+            self.whale_threshold: int | None = whale_threshold
+        elif self.config is not None and getattr(self.config, "whale_order_threshold", None) is not None:
+            self.whale_threshold = self.config.whale_order_threshold
+        else:
+            self.whale_threshold = None
+        self.whale_callback = whale_callback
+        self.last_whale_order: dict[str, Any] | None = None
+        self.metrics.whale_order_threshold = self.whale_threshold
 
         # Latency instrumentation state
         self._instrument_latency: bool = instrument_latency
@@ -365,6 +389,41 @@ class TradingPipeline:
         return self._core_latency_tracker
 
     # --------------------------------------------------------------------------
+    # Whale Order Detection & Sweep Telemetry
+    # --------------------------------------------------------------------------
+
+    def _handle_order_and_trades(
+        self,
+        order: Order,
+        trades: list[Trade],
+        original_quantity: int | None = None,
+    ) -> None:
+        """Inspect executed order for whale thresholds and multi-level price sweeps."""
+        swept_levels = len({t.price for t in trades}) if trades else 0
+        if swept_levels > 1:
+            self.metrics.multi_level_sweeps += 1
+
+        qty = original_quantity if original_quantity is not None else order.quantity
+        is_whale = self.whale_threshold is not None and qty >= self.whale_threshold
+        if is_whale:
+            self.metrics.whale_orders_detected += 1
+            self.metrics.whale_volume_executed += qty
+            side_str = order.side.name if hasattr(order.side, "name") else str(order.side)
+            self.last_whale_order = {
+                "order_id": order.order_id,
+                "side": side_str,
+                "price": float(order.price) if order.price is not None else None,
+                "quantity": qty,
+                "swept_levels": swept_levels,
+                "timestamp": getattr(order, "timestamp", None),
+            }
+            if self.whale_callback is not None:
+                try:
+                    self.whale_callback(order, trades, swept_levels)
+                except Exception:
+                    pass
+
+    # --------------------------------------------------------------------------
     # Deterministic Single-Step & Manual Ingestion
     # --------------------------------------------------------------------------
 
@@ -399,6 +458,7 @@ class TradingPipeline:
             self._wal.append_order(consumed_order)
 
         trades: list[Trade] = []
+        orig_qty = getattr(consumed_order, "quantity", 0)
         try:
             try:
                 consumed_order._chronos_timed = True
@@ -413,6 +473,7 @@ class TradingPipeline:
                 self._wal.append_trades(trades)
             if self._trade_store is not None and trades:
                 self._trade_store.append_trades(trades)
+            self._handle_order_and_trades(consumed_order, trades, original_quantity=orig_qty)
         except DuplicateOrderError:
             self.metrics.duplicate_orders += 1
             raise
@@ -527,6 +588,7 @@ class TradingPipeline:
             self.metrics.orders_processed += 1
             processed += 1
 
+            orig_qty = getattr(order, "quantity", 0)
             try:
                 try:
                     order._chronos_timed = True
@@ -541,6 +603,7 @@ class TradingPipeline:
                     self._wal.append_trades(trades)
                 if self._trade_store is not None and trades:
                     self._trade_store.append_trades(trades)
+                self._handle_order_and_trades(order, trades, original_quantity=orig_qty)
             except DuplicateOrderError:
                 self.metrics.duplicate_orders += 1
             except Exception:
@@ -614,6 +677,7 @@ class TradingPipeline:
                 self.metrics.orders_processed += 1
                 processed += 1
 
+                orig_qty = getattr(order, "quantity", 0)
                 try:
                     trades = self.engine.process_order(order)
                     t3 = time.perf_counter_ns()
@@ -625,6 +689,7 @@ class TradingPipeline:
                             self._wal.append_trades(trades)
                         if self._trade_store is not None:
                             self._trade_store.append_trades(trades)
+                    self._handle_order_and_trades(order, trades, original_quantity=orig_qty)
                 except DuplicateOrderError:
                     self.metrics.duplicate_orders += 1
 
@@ -644,6 +709,7 @@ class TradingPipeline:
             min_quantity=self.config.min_quantity,
             max_quantity=self.config.max_quantity,
             quantity_step=self.config.quantity_step,
+            whale_order_threshold=self.config.whale_order_threshold,
             buy_ratio=self.config.buy_ratio,
             spread_ticks=self.config.spread_ticks,
             crossing_probability=self.config.crossing_probability,
@@ -664,10 +730,10 @@ class TradingPipeline:
         base_drop = self.metrics.orders_dropped
         base_bp = self.metrics.backpressure_events
 
-        def on_order_generated() -> None:
+        def on_order(ord: Order) -> None:
             self.metrics.orders_generated += 1
 
-        def on_publish_fields(order_id: str, ts: int) -> None:
+        def on_publish(ord: Order) -> None:
             self.metrics.orders_published += 1
             if self._instrument_latency:
                 t1 = time.perf_counter_ns()
@@ -676,15 +742,15 @@ class TradingPipeline:
                         self._pending_published.pop(next(iter(self._pending_published)))
                     except Exception:
                         pass
-                self._pending_published[order_id] = (ts, t1)
+                self._pending_published[ord.order_id] = (getattr(ord, "timestamp", None), t1)
 
         async def _producer_loop() -> None:
             try:
                 await sim.run(
                     producer=self._producer,
                     cancel_callback=on_cancel,
-                    order_fields_callback=on_order_generated,
-                    publish_fields_callback=on_publish_fields,
+                    order_callback=on_order,
+                    publish_callback=on_publish,
                 )
             finally:
                 # Synchronize final simulator metrics back into pipeline metrics
@@ -971,6 +1037,8 @@ def create_pipeline(
     durability_policy: DurabilityPolicy = DurabilityPolicy.FLUSH_ON_WRITE,
     instrument_latency: bool = False,
     latency_callback: Callable[[float | None, float | None, float | None], None] | None = None,
+    whale_threshold: int | None = None,
+    whale_callback: Callable[[Order, list[Trade], int], None] | None = None,
 ) -> TradingPipeline:
     """Convenience factory function to instantiate a TradingPipeline.
 
@@ -985,6 +1053,8 @@ def create_pipeline(
         durability_policy: Durability guarantee for disk writes.
         instrument_latency: If True, instruments core, dwell, and tick-to-trade latency.
         latency_callback: Optional callable for latency callbacks.
+        whale_threshold: Configurable whale order threshold.
+        whale_callback: Optional callback invoked when a whale order is detected.
 
     Returns:
         Configured TradingPipeline instance.
@@ -1000,4 +1070,6 @@ def create_pipeline(
         durability_policy=durability_policy,
         instrument_latency=instrument_latency,
         latency_callback=latency_callback,
+        whale_threshold=whale_threshold,
+        whale_callback=whale_callback,
     )
