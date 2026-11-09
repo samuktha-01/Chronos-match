@@ -18,6 +18,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import random
 import sys
@@ -35,6 +36,10 @@ from chronosmatch.dashboard.pipeline_runner import (
 )
 from chronosmatch.dashboard.terminal import (
     TerminalDashboard,
+)
+from chronosmatch.dashboard.curses_backend import (
+    DashboardBackend,
+    create_dashboard,
 )
 from chronosmatch.market_simulator import (
     MarketFeedConfig,
@@ -169,6 +174,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Use plain ASCII box borders instead of Unicode",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["ansi", "curses", "auto"],
+        default="ansi" if os.name == "nt" else "auto",
+        help="Terminal UI rendering backend ('ansi', 'curses', or 'auto'). Default is 'ansi' on Windows.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -179,11 +190,13 @@ def main(argv: list[str] | None = None) -> int:
     # Single-shot execution
     if args.once:
         collector = DashboardMetricsCollector(source_name="ChronosMatch Snapshot")
-        dashboard = TerminalDashboard(
+        dashboard = create_dashboard(
             collector=collector,
+            backend=args.backend,
             interactive=False,
             use_colors=not args.no_color,
             use_unicode=False if args.ascii else None,
+            fallback_to_ansi=True,
         )
         dashboard.render_once()
         return 0
@@ -200,13 +213,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         demo_thread.start()
 
-        dashboard = TerminalDashboard(
+        dashboard = create_dashboard(
             collector=collector,
+            backend=args.backend,
             refresh_interval=args.refresh,
             interactive=False if args.plain else None,
             use_colors=not args.no_color,
             use_unicode=False if args.ascii else None,
             clear_screen=not args.plain,
+            fallback_to_ansi=True,
         )
 
         try:
@@ -252,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         interactive=False if args.plain else None,
         use_colors=not args.no_color,
         use_unicode=False if args.ascii else None,
+        backend=args.backend,
     )
 
     try:

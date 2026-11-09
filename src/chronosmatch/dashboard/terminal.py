@@ -1074,6 +1074,13 @@ class TerminalDashboard:
         return self._thread is not None and self._thread.is_alive()
 
     @property
+    def backend(self) -> Any:
+        """Active dashboard rendering backend."""
+        from chronosmatch.dashboard.curses_backend import DashboardBackend
+
+        return DashboardBackend.ANSI
+
+    @property
     def interactive(self) -> bool:
         """Return True if dashboard operates with interactive terminal cursor controls."""
         return self._interactive

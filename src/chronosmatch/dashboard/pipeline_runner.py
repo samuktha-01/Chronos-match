@@ -37,6 +37,11 @@ from chronosmatch.dashboard.metrics import (
 from chronosmatch.dashboard.terminal import (
     TerminalDashboard,
 )
+from chronosmatch.dashboard.curses_backend import (
+    CursesDashboard,
+    DashboardBackend,
+    resolve_backend,
+)
 from chronosmatch.market_simulator import (
     MarketFeedConfig,
     SimulationMode,
@@ -154,6 +159,7 @@ class PipelineDashboardRunner:
         output: TextIO | None = None,
         instrument_latency: bool = True,
         source_name: str | None = None,
+        backend: str | DashboardBackend | None = None,
     ) -> None:
         """Initialize PipelineDashboardRunner.
 
@@ -167,6 +173,7 @@ class PipelineDashboardRunner:
             output: Destination output stream (defaults to sys.stdout).
             instrument_latency: If True, enables latency instrumentation.
             source_name: Descriptive name for reporting (defaults to engine mode name).
+            backend: Dashboard rendering backend ('ansi', 'curses', or 'auto'). Defaults to ANSI on Windows.
         """
         self._owns_pipeline: bool = pipeline is None
         self._pipeline: TradingPipeline = pipeline if pipeline is not None else create_pipeline()
@@ -215,15 +222,31 @@ class PipelineDashboardRunner:
             source_name=resolved_source,
         )
 
-        self._dashboard = TerminalDashboard(
-            collector=self._collector,
-            refresh_interval=refresh_interval,
-            interactive=interactive,
-            use_colors=use_colors,
-            use_unicode=use_unicode,
-            width=width,
-            output=output,
-        )
+        resolved_backend = resolve_backend(backend, stream=output, fallback_to_ansi=True)
+        self._resolved_backend: DashboardBackend = resolved_backend
+
+        if resolved_backend == DashboardBackend.CURSES:
+            self._dashboard: Any = CursesDashboard(
+                collector=self._collector,
+                refresh_interval=refresh_interval,
+                on_exit=self.stop,
+                stream=output,
+            )
+        else:
+            self._dashboard = TerminalDashboard(
+                collector=self._collector,
+                refresh_interval=refresh_interval,
+                interactive=interactive,
+                use_colors=use_colors,
+                use_unicode=use_unicode,
+                width=width,
+                output=output,
+            )
+
+    @property
+    def backend(self) -> DashboardBackend:
+        """Active dashboard rendering backend."""
+        return self._resolved_backend
 
     @property
     def pipeline(self) -> TradingPipeline:
@@ -387,6 +410,7 @@ def run_pipeline_with_dashboard(
     use_colors: bool = True,
     use_unicode: bool | None = None,
     output: TextIO | None = None,
+    backend: str | DashboardBackend | None = None,
 ) -> TradingPipelineMetrics:
     """Run a ChronosMatch TradingPipeline with live TerminalDashboard telemetry.
 
@@ -401,6 +425,7 @@ def run_pipeline_with_dashboard(
         use_colors: If True, applies ANSI color sequences.
         use_unicode: If True, uses Unicode borders; if None, auto-detects from stream.
         output: Destination stream (defaults to sys.stdout).
+        backend: Dashboard rendering backend ('ansi', 'curses', or 'auto'). Defaults to ANSI on Windows.
 
     Returns:
         Populated TradingPipelineMetrics from the completed simulation run.
@@ -420,6 +445,7 @@ def run_pipeline_with_dashboard(
         use_colors=use_colors,
         use_unicode=use_unicode,
         output=output,
+        backend=backend,
     )
 
     try:

@@ -31,6 +31,18 @@ from chronosmatch.dashboard.pipeline_runner import (
     PipelineDashboardRunner,
     run_pipeline_with_dashboard,
 )
+from chronosmatch.dashboard.curses_backend import (
+    CursesColorTheme,
+    CursesDashboard,
+    CursesRenderer,
+    CursesUnsupportedError,
+    DashboardBackend,
+    can_initialize_curses,
+    create_dashboard,
+    is_curses_available,
+    resolve_backend,
+    safe_addstr,
+)
 
 __all__ = [
     "LatencyStats",
@@ -58,4 +70,14 @@ __all__ = [
     "LatencyInstrumentedEngine",
     "PipelineDashboardRunner",
     "run_pipeline_with_dashboard",
+    "DashboardBackend",
+    "CursesUnsupportedError",
+    "is_curses_available",
+    "can_initialize_curses",
+    "resolve_backend",
+    "CursesColorTheme",
+    "safe_addstr",
+    "CursesRenderer",
+    "CursesDashboard",
+    "create_dashboard",
 ]
