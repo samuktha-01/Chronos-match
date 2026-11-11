@@ -477,6 +477,63 @@ class CursesRenderer:
             )
             cur_y += 1
 
+            # Multi-Level Order Book Depth Ladder (Top 5)
+            bids = snapshot.bids_depth if snapshot.bids_depth is not None else []
+            asks = snapshot.asks_depth if snapshot.asks_depth is not None else []
+            if (snapshot.bids_depth is not None or snapshot.asks_depth is not None) and cur_y + 3 < max_y:
+                sub_title = "ORDER BOOK L2 DEPTH LADDER (TOP 5)"
+                safe_addstr(win, cur_y, start_x + 2, f"-- {sub_title} --", theme.cyan(bold=True))
+                cur_y += 1
+                if not bids and not asks:
+                    safe_addstr(win, cur_y, start_x + 2, "(Order book depth is empty - awaiting orders)", theme.gray())
+                    cur_y += 1
+                else:
+                    col_w = (width - 6) // 2
+                    hdr_left = "BID DEPTH    QTY       BID PRICE"
+                    hdr_right = "ASK PRICE       QTY    ASK DEPTH"
+                    safe_addstr(win, cur_y, start_x + 2, f"{hdr_left:<{col_w}}", theme.green())
+                    safe_addstr(win, cur_y, start_x + 2 + col_w, " | ", theme.gray())
+                    safe_addstr(win, cur_y, start_x + 5 + col_w, f"{hdr_right:<{col_w}}", theme.red())
+                    cur_y += 1
+
+                    all_qtys = [q for _, q in bids[:5]] + [q for _, q in asks[:5]]
+                    max_qty = max(all_qtys) if all_qtys else 1
+                    max_qty = max(max_qty, 1)
+                    bar_len = 6
+                    num_rows = min(5, max(len(bids[:5]), len(asks[:5])))
+
+                    for i in range(num_rows):
+                        if cur_y >= max_y - 2:
+                            break
+                        if i < len(bids):
+                            bp, bq = bids[i]
+                            b_filled = max(0, min(bar_len, int(round((bq / max_qty) * bar_len))))
+                            b_bar = "#" * b_filled + "-" * (bar_len - b_filled)
+                            b_price_str = f"${float(bp):,.2f}" + ("*" if i == 0 else " ")
+                            b_qty_str = f"{bq:,}"
+                            bid_text = f"#{i+1:<2} [{b_bar}] {b_qty_str:>6}  {b_price_str:>9}"
+                            b_attr = theme.green(bold=(i == 0))
+                        else:
+                            bid_text = " --  [------]     --         -- "
+                            b_attr = theme.gray()
+
+                        if i < len(asks):
+                            ap, aq = asks[i]
+                            a_filled = max(0, min(bar_len, int(round((aq / max_qty) * bar_len))))
+                            a_bar = "#" * a_filled + "-" * (bar_len - a_filled)
+                            a_price_str = ("*" if i == 0 else " ") + f"${float(ap):,.2f}"
+                            a_qty_str = f"{aq:,}"
+                            ask_text = f"{a_price_str:<9}  {a_qty_str:>6} [{a_bar}] #{i+1:>2}"
+                            a_attr = theme.red(bold=(i == 0))
+                        else:
+                            ask_text = "       --        --  [------]  --"
+                            a_attr = theme.gray()
+
+                        safe_addstr(win, cur_y, start_x + 2, f"{bid_text:<{col_w}}", b_attr)
+                        safe_addstr(win, cur_y, start_x + 2 + col_w, " | ", theme.gray())
+                        safe_addstr(win, cur_y, start_x + 5 + col_w, f"{ask_text:<{col_w}}", a_attr)
+                        cur_y += 1
+
         # Section 4: Ring Buffer Telemetry
         if cur_y + 4 < max_y:
             safe_addstr(win, cur_y, start_x, h_border, theme.gray())

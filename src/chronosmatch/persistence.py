@@ -589,6 +589,9 @@ class WriteAheadLog:
     def append_trades(self, trades: list[Trade]) -> list[int]:
         """Serialize and append a batch of Trade executions to the WAL.
 
+        Uses group commit: writes all trade record frames under lock and flushes
+        once per batch according to the configured DurabilityPolicy.
+
         Args:
             trades: List of executed trades to record.
 
@@ -599,8 +602,15 @@ class WriteAheadLog:
             return []
         lsns: list[int] = []
         with self._lock:
-            for trade in trades:
-                lsns.append(self.append_trade(trade))
+            old_auto = self._auto_flush
+            try:
+                self._auto_flush = False
+                for trade in trades:
+                    lsns.append(self.append_trade(trade))
+            finally:
+                self._auto_flush = old_auto
+            if old_auto and self._durability != DurabilityPolicy.ASYNC_BUFFERED:
+                self._flush_file()
         return lsns
 
     def append_checkpoint(self, last_order_seq: int = 0, last_trade_id: int = 0) -> int:

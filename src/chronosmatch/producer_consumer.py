@@ -584,9 +584,10 @@ def _default_consumer_worker(
             except RingBufferEmptyError:
                 if stop_event is not None and stop_event.is_set() and consumer.is_empty:
                     break
-                if timeout is not None and (time.monotonic() - idle_start) >= timeout:
+                effective_timeout = max(timeout, 10.0) if (received_count == 0 and timeout is not None) else timeout
+                if effective_timeout is not None and (time.monotonic() - idle_start) >= effective_timeout:
                     raise RingBufferEmptyError(
-                        f"Consumer timed out after {timeout:.2f}s waiting for order #{received_count + 1}"
+                        f"Consumer timed out after {effective_timeout:.2f}s waiting for order #{received_count + 1}"
                     )
     except Exception as e:
         if error_queue is not None:
@@ -650,9 +651,10 @@ def _matching_consumer_worker(
             except RingBufferEmptyError:
                 if stop_event is not None and stop_event.is_set() and consumer.is_empty:
                     break
-                if timeout is not None and (time.monotonic() - idle_start) >= timeout:
+                effective_timeout = max(timeout, 10.0) if (received_count == 0 and timeout is not None) else timeout
+                if effective_timeout is not None and (time.monotonic() - idle_start) >= effective_timeout:
                     raise RingBufferEmptyError(
-                        f"Matching consumer timed out after {timeout:.2f}s waiting for order #{received_count + 1}"
+                        f"Matching consumer timed out after {effective_timeout:.2f}s waiting for order #{received_count + 1}"
                     )
     except Exception as e:
         if error_queue is not None:
@@ -990,8 +992,18 @@ class OrderPipeline:
             expected_count = len(orders)
 
         self._ensure_buffer_initialized()
-        producer = self.start_producer(orders=orders, timeout=timeout)
+        self._ready_event.set()
         consumer = self.start_consumer(expected_count=expected_count, timeout=timeout)
+
+        # Wait bounded time for consumer process to initialize and open the ring buffer
+        start_wait_deadline = time.monotonic() + 10.0
+        while time.monotonic() < start_wait_deadline:
+            if self._start_event.wait(timeout=0.05):
+                break
+            if self._consumer_proc is not None and not self._consumer_proc.is_alive():
+                break
+
+        producer = self.start_producer(orders=orders, timeout=timeout)
         return producer, consumer
 
     def get_producer(self) -> OrderProducer:

@@ -295,6 +295,8 @@ class DashboardMetricsSnapshot:
     queue_dwell_latency: LatencyStats | None = None
     tick_to_trade_latency: LatencyStats | None = None
     order_book_depth_levels: int | None = None
+    bids_depth: list[tuple[float | int | Decimal, int]] | None = None
+    asks_depth: list[tuple[float | int | Decimal, int]] | None = None
     whale_orders_detected: int | None = None
     whale_volume_executed: int | None = None
     multi_level_sweeps: int | None = None
@@ -338,6 +340,8 @@ class DashboardMetricsSnapshot:
             "best_ask": float(self.best_ask) if self.best_ask is not None else None,
             "spread": float(self.spread) if self.spread is not None else None,
             "order_book_depth_levels": self.order_book_depth_levels,
+            "bids_depth": self.bids_depth,
+            "asks_depth": self.asks_depth,
             "whale_orders_detected": self.whale_orders_detected,
             "whale_volume_executed": self.whale_volume_executed,
             "multi_level_sweeps": self.multi_level_sweeps,
@@ -443,6 +447,8 @@ class DashboardMetricsCollector:
         self._manual_whale_volume_executed: int | None = None
         self._manual_multi_level_sweeps: int | None = None
         self._manual_last_whale_order: dict[str, Any] | None = None
+        self._manual_bids_depth: list[tuple[float | int | Decimal, int]] | None = None
+        self._manual_asks_depth: list[tuple[float | int | Decimal, int]] | None = None
 
         if pipeline is not None:
             self.attach_pipeline(pipeline)
@@ -615,6 +621,16 @@ class DashboardMetricsCollector:
             current = self._manual_multi_level_sweeps or 0
             self._manual_multi_level_sweeps = current + count
 
+    def set_order_book_depth(
+        self,
+        bids: list[tuple[float | int | Decimal, int]] | None,
+        asks: list[tuple[float | int | Decimal, int]] | None,
+    ) -> None:
+        """Manually configure Level 2 order book depth for testing or standalone demo mode."""
+        with self._lock:
+            self._manual_bids_depth = list(bids) if bids is not None else None
+            self._manual_asks_depth = list(asks) if asks is not None else None
+
     # --------------------------------------------------------------------------
     # Snapshot Generation
     # --------------------------------------------------------------------------
@@ -651,7 +667,9 @@ class DashboardMetricsCollector:
             malformed, duplicate, proc_errors, backpressure = self._resolve_error_metrics()
 
             # 6. Market Depth & Prices
-            best_bid, best_ask, spread, depth_levels = self._resolve_market_state()
+            best_bid, best_ask, spread, depth_levels, bids_depth, asks_depth = (
+                self._resolve_market_state()
+            )
 
             # 7. Latency Telemetry (Core, Queue Dwell & Tick-to-Trade)
             core_stats = self._core_latency_tracker.get_stats()
@@ -719,6 +737,8 @@ class DashboardMetricsCollector:
                 best_ask=best_ask,
                 spread=spread,
                 order_book_depth_levels=depth_levels,
+                bids_depth=bids_depth,
+                asks_depth=asks_depth,
                 whale_orders_detected=whale_detected,
                 whale_volume_executed=whale_volume,
                 multi_level_sweeps=whale_sweeps,
@@ -955,19 +975,23 @@ class DashboardMetricsCollector:
         float | int | Decimal | None,
         float | int | Decimal | None,
         int | None,
+        list[tuple[float | int | Decimal, int]] | None,
+        list[tuple[float | int | Decimal, int]] | None,
     ]:
         eng = self._engine
         if eng is None and self._pipeline is not None:
             eng = getattr(self._pipeline, "engine", None)
 
         if eng is None:
-            return None, None, None, None
+            return None, None, None, None, self._manual_bids_depth, self._manual_asks_depth
 
         best_bid = getattr(eng, "best_bid", None)
         best_ask = getattr(eng, "best_ask", None)
         spread = getattr(eng, "spread", None)
 
         depth_levels = None
+        bids_depth = None
+        asks_depth = None
         book = getattr(eng, "order_book", None)
         if book is not None:
             bids = getattr(book, "bids", None)
@@ -975,8 +999,17 @@ class DashboardMetricsCollector:
             b_levels = len(bids.price_levels) if bids and hasattr(bids, "price_levels") else (len(bids.depth()) if bids and hasattr(bids, "depth") else 0)
             a_levels = len(asks.price_levels) if asks and hasattr(asks, "price_levels") else (len(asks.depth()) if asks and hasattr(asks, "depth") else 0)
             depth_levels = b_levels + a_levels
+            if bids and hasattr(bids, "depth"):
+                bids_depth = bids.depth(5)
+            if asks and hasattr(asks, "depth"):
+                asks_depth = asks.depth(5)
 
-        return best_bid, best_ask, spread, depth_levels
+        if bids_depth is None and self._manual_bids_depth is not None:
+            bids_depth = list(self._manual_bids_depth)
+        if asks_depth is None and self._manual_asks_depth is not None:
+            asks_depth = list(self._manual_asks_depth)
+
+        return best_bid, best_ask, spread, depth_levels, bids_depth, asks_depth
 
     def _resolve_whale_metrics(
         self,

@@ -646,52 +646,60 @@ class TradingPipeline:
             except Exception:
                 pass
 
-        # Concurrent consumer draining coroutine
+        # Concurrent consumer draining coroutine with batched draining
         async def _consumer_loop() -> None:
             processed = 0
+            batch_limit = 64
             while not self._stop_event.is_set() or not self._consumer.is_empty:
                 if target_count is not None and processed >= target_count:
                     break
 
-                try:
-                    order = self._consumer.get_nowait()
-                    t2 = time.perf_counter_ns()
-                except RingBufferEmptyError:
-                    if self._stop_event.is_set():
+                batch_count = 0
+                while batch_count < batch_limit and (target_count is None or processed < target_count):
+                    try:
+                        order = self._consumer.get_nowait()
+                        t2 = time.perf_counter_ns()
+                    except RingBufferEmptyError:
+                        break
+                    except (MalformedRecordError, SharedMemoryError, ValueError, TypeError):
+                        self.metrics.orders_consumed += 1
+                        self.metrics.malformed_messages += 1
+                        continue
+
+                    batch_count += 1
+                    ts_info = self._pending_published.pop(order.order_id, None) if self._instrument_latency else None
+                    t0, t1 = ts_info if ts_info is not None else (getattr(order, "timestamp", None), None)
+
+                    self.metrics.orders_consumed += 1
+
+                    if self._wal is not None:
+                        self._wal.append_order(order)
+
+                    self.metrics.orders_processed += 1
+                    processed += 1
+
+                    orig_qty = getattr(order, "quantity", 0)
+                    try:
+                        trades = self.engine.process_order(order)
+                        t3 = time.perf_counter_ns()
+                        self._emit_latency(t0=t0, t1=t1, t2=t2, t3=t3)
+                        if trades:
+                            self.metrics.trades_executed += len(trades)
+                            self.metrics.volume_executed += sum(t.quantity for t in trades)
+                            if self._wal is not None:
+                                self._wal.append_trades(trades)
+                            if self._trade_store is not None:
+                                self._trade_store.append_trades(trades)
+                        self._handle_order_and_trades(order, trades, original_quantity=orig_qty)
+                    except DuplicateOrderError:
+                        self.metrics.duplicate_orders += 1
+
+                if batch_count == 0:
+                    if self._stop_event.is_set() and self._consumer.is_empty:
                         break
                     await asyncio.sleep(0)
-                    continue
-                except (MalformedRecordError, SharedMemoryError, ValueError, TypeError):
-                    self.metrics.orders_consumed += 1
-                    self.metrics.malformed_messages += 1
-                    continue
-
-                ts_info = self._pending_published.pop(order.order_id, None) if self._instrument_latency else None
-                t0, t1 = ts_info if ts_info is not None else (getattr(order, "timestamp", None), None)
-
-                self.metrics.orders_consumed += 1
-
-                if self._wal is not None:
-                    self._wal.append_order(order)
-
-                self.metrics.orders_processed += 1
-                processed += 1
-
-                orig_qty = getattr(order, "quantity", 0)
-                try:
-                    trades = self.engine.process_order(order)
-                    t3 = time.perf_counter_ns()
-                    self._emit_latency(t0=t0, t1=t1, t2=t2, t3=t3)
-                    if trades:
-                        self.metrics.trades_executed += len(trades)
-                        self.metrics.volume_executed += sum(t.quantity for t in trades)
-                        if self._wal is not None:
-                            self._wal.append_trades(trades)
-                        if self._trade_store is not None:
-                            self._trade_store.append_trades(trades)
-                    self._handle_order_and_trades(order, trades, original_quantity=orig_qty)
-                except DuplicateOrderError:
-                    self.metrics.duplicate_orders += 1
+                else:
+                    await asyncio.sleep(0)
 
         # Producer coroutine: wraps simulator.run()
         sim_config = MarketFeedConfig(

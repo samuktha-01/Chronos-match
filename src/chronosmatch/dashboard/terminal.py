@@ -349,6 +349,7 @@ class DashboardRenderer:
         use_colors: bool = True,
         use_unicode: bool = True,
         width: int = 80,
+        show_depth_ladder: bool | None = None,
     ) -> None:
         """Initialize DashboardRenderer.
 
@@ -356,10 +357,12 @@ class DashboardRenderer:
             use_colors: If True, apply ANSI color escapes. If False, produce plain text.
             use_unicode: If True, use Unicode box characters. If False, use standard ASCII.
             width: Total terminal column width (minimum 74).
+            show_depth_ladder: Explicit toggle for Level 2 order book depth ladder.
         """
         self.use_colors = use_colors
         self.use_unicode = use_unicode
         self.width = max(74, width)
+        self.show_depth_ladder = show_depth_ladder
         self.styler = AnsiStyler(enabled=use_colors)
         self.box = UNICODE_BOX if use_unicode else ASCII_BOX
 
@@ -445,6 +448,116 @@ class DashboardRenderer:
 
         status_text = "READY"
         return self.styler.cyan(status_text) if self.styler.enabled else status_text
+
+    def _render_depth_ladder(self, snapshot: DashboardMetricsSnapshot) -> list[str]:
+        """Render Level 2 Order Book Depth Ladder showing top 5 bids and top 5 asks."""
+        if snapshot.bids_depth is None and snapshot.asks_depth is None:
+            return []
+
+        if self.show_depth_ladder is False:
+            return []
+
+        bids = snapshot.bids_depth if snapshot.bids_depth is not None else []
+        asks = snapshot.asks_depth if snapshot.asks_depth is not None else []
+
+        if self.show_depth_ladder is None:
+            # Active two-sided market, multi-level book depth (>= 2), or explicit empty book test
+            has_depth = (
+                (len(bids) + len(asks) >= 2)
+                or (snapshot.spread is not None)
+                or (len(bids) == 0 and len(asks) == 0)
+            )
+            if not has_depth:
+                return []
+
+        styler = self.styler
+        box = self.box
+        lines: list[str] = []
+
+        # Sub-header for Depth Ladder
+        h_bar = box.horizontal * 2
+        sub_title = "ORDER BOOK L2 DEPTH LADDER (TOP 5)"
+        styled_sub = styler.bold(sub_title) if styler.enabled else sub_title
+        lines.append(self._pad_row(f"  {h_bar} {styled_sub} {h_bar}"))
+
+        if not bids and not asks:
+            empty_msg = styler.gray("(Order book depth is empty - awaiting orders)") if styler.enabled else "(Order book depth is empty - awaiting orders)"
+            lines.append(self._pad_row(f"  {empty_msg}"))
+            return lines
+
+        # Column header: Bids on left, Asks on right
+        bid_hdr = "  BID DEPTH    QTY       BID PRICE"
+        ask_hdr = "ASK PRICE       QTY    ASK DEPTH  "
+        hdr_sep = f" {box.vertical} "
+        if styler.enabled:
+            bid_hdr_styled = styler.green(bid_hdr)
+            ask_hdr_styled = styler.red(ask_hdr)
+            lines.append(self._pad_row(f"{bid_hdr_styled}{hdr_sep}{ask_hdr_styled}"))
+        else:
+            lines.append(self._pad_row(f"{bid_hdr}{hdr_sep}{ask_hdr}"))
+
+        # Determine max quantity for scaling depth bars
+        all_qtys = [q for _, q in bids[:5]] + [q for _, q in asks[:5]]
+        max_qty = max(all_qtys) if all_qtys else 1
+        max_qty = max(max_qty, 1)
+
+        bar_len = 8
+        num_rows = max(len(bids[:5]), len(asks[:5]))
+
+        for i in range(min(5, max(num_rows, 1))):
+            # Bid side (Left)
+            if i < len(bids):
+                b_price, b_qty = bids[i]
+                b_ratio = min(1.0, max(0.0, b_qty / max_qty))
+                b_filled = int(round(b_ratio * bar_len))
+                b_bar_raw = box.gauge_full * b_filled + box.gauge_empty * (bar_len - b_filled)
+                b_bar = styler.green(b_bar_raw) if styler.enabled else b_bar_raw
+                b_qty_str = f"{b_qty:,}"
+                b_price_str = f"${float(b_price):,.2f}"
+                if i == 0:
+                    b_price_styled = styler.bold(styler.green(f"{b_price_str}*")) if styler.enabled else f"{b_price_str}*"
+                else:
+                    b_price_styled = styler.green(f"{b_price_str} ") if styler.enabled else f"{b_price_str} "
+
+                rank_str = f"#{i+1}"
+                left_col = f"  {rank_str:<3} [{b_bar}] {b_qty_str:>7}  {b_price_styled:>10}"
+            else:
+                left_col = "  --  [--------]       --          -- "
+                if styler.enabled:
+                    left_col = styler.gray(left_col)
+
+            # Ask side (Right)
+            if i < len(asks):
+                a_price, a_qty = asks[i]
+                a_ratio = min(1.0, max(0.0, a_qty / max_qty))
+                a_filled = int(round(a_ratio * bar_len))
+                a_bar_raw = box.gauge_full * a_filled + box.gauge_empty * (bar_len - a_filled)
+                a_bar = styler.red(a_bar_raw) if styler.enabled else a_bar_raw
+                a_qty_str = f"{a_qty:,}"
+                a_price_str = f"${float(a_price):,.2f}"
+                if i == 0:
+                    a_price_styled = styler.bold(styler.red(f"*{a_price_str}")) if styler.enabled else f"*{a_price_str}"
+                else:
+                    a_price_styled = styler.red(f" {a_price_str}") if styler.enabled else f" {a_price_str}"
+
+                rank_str = f"#{i+1}"
+                right_col = f"{a_price_styled:<10}  {a_qty_str:>7} [{a_bar}] {rank_str:>3}  "
+            else:
+                right_col = "         --        --  [--------]  --  "
+                if styler.enabled:
+                    right_col = styler.gray(right_col)
+
+            pad_left = 36 - visible_len(left_col)
+            if pad_left > 0:
+                left_col = left_col + (" " * pad_left)
+            pad_right = 36 - visible_len(right_col)
+            if pad_right > 0:
+                right_col = right_col + (" " * pad_right)
+
+            row_text = f"{left_col} {box.vertical} {right_col}"
+            lines.append(self._pad_row(row_text))
+
+        return lines
 
     def render(
         self,
@@ -587,6 +700,7 @@ class DashboardRenderer:
                 format_int(snapshot.order_book_depth_levels, styler),
             )
         )
+        lines.extend(self._render_depth_ladder(snapshot))
 
         # ----------------------------------------------------------------------
         # 4. Ring Buffer Telemetry & Utilization

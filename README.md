@@ -2,8 +2,8 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-513%20passed-brightgreen.svg)](tests/)
-[![Architecture Status](https://img.shields.io/badge/status-phase%2012%20complete-brightgreen.svg)](docs/architecture.md)
+[![Tests](https://img.shields.io/badge/tests-733%20passed-brightgreen.svg)](tests/)
+[![Architecture Status](https://img.shields.io/badge/status-100%25%20complete-brightgreen.svg)](docs/architecture.md)
 
 An in-memory, HFT-style simulated order-matching engine and low-latency systems testbed built with mechanical sympathy, zero-copy shared-memory IPC, lock-free ring buffers, and a deterministic limit order book.
 
@@ -115,9 +115,9 @@ ChronosMatch adopts a staged, test-driven engineering approach. Below is the exp
 | **Shared-Memory IPC & Message Schemas** | Phase 2 | **Implemented** | 64-byte `ORDER_STRUCT` cache-aligned binary protocol, cross-platform shared memory (`mmap`). |
 | **Lock-Free Ring Buffer** | Phase 3 | **Implemented** | SPSC circular ring buffer with atomic memory barriers, power-of-two bitmask indexing, bounded put/get. |
 | **Cython LOB & Matching Core** | Phase 4 | **Implemented** | L3 price-time priority order book, intrusive queue, Python baseline + compiled Cython extension. |
-| **Market Feed & Pipeline Integration** | Phase 5 | **Implemented** | Bursty Poisson market feed simulator, backpressure handling, end-to-end `TradingPipeline` integration. |
-| **Trade Persistence & Crash Recovery** | Phase 12 | **Implemented** | Append-only binary WAL (CRC32, LSN), `TradeStore`, `DurabilityPolicy`, deterministic replay and crash recovery. |
-| **Terminal Dashboard & Telemetry** | Phase 13 | **Implemented** | Non-blocking terminal UI, real-time BBO spread, order flow, ring buffer telemetry, and microsecond latency distribution (p50/p95/p99). |
+| **Market Feed & Pipeline Integration** | Phase 5 | **Implemented** | Bursty Poisson market feed simulator, backpressure handling, batched consumer draining, end-to-end `TradingPipeline` integration. |
+| **Trade Persistence & Crash Recovery** | Phase 12 | **Implemented** | Append-only binary WAL (CRC32, LSN), WAL group commit, `TradeStore`, `DurabilityPolicy`, deterministic replay and crash recovery. |
+| **Terminal Dashboard & Telemetry** | Phase 13 | **Implemented** | Non-blocking dual-backend (ANSI + Python Curses) terminal UI, Level 2 depth ladder (Top 5 Bids/Asks), Whale Order alerts, Multi-level sweeps, BBO spread, and microsecond latency distribution (Core/Dwell/TTT). |
 
 ---
 
@@ -220,21 +220,16 @@ rootdir: ...\Chronos-match
 configfile: pyproject.toml
 testpaths: tests
 plugins: anyio-4.12.1, asyncio-1.4.0
-collected 578 items
+collected 733 items
 
-tests\test_project_setup.py::test_package_import PASSED                   [ 25%]
-tests\test_project_setup.py::test_package_version PASSED                  [ 50%]
-tests\test_project_setup.py::test_package_exports PASSED                  [ 75%]
-tests\test_project_setup.py::test_package_docstring PASSED                [100%]
-
-============================ 578 passed in 16.37s =============================
+============================ 733 passed in 19.93s =============================
 ```
 
 ---
 
 ### Launching the Real-Time Terminal Dashboard
 
-ChronosMatch includes an interactive, decoupled terminal dashboard providing real-time telemetry from the live trading pipeline or a standalone simulation.
+ChronosMatch includes an interactive, decoupled terminal dashboard providing real-time telemetry from the live trading pipeline or a standalone simulation, supporting both ANSI and Python Curses backends.
 
 #### 1. Live Pipeline Execution (Default)
 Run a live end-to-end simulation through the market feed, shared-memory IPC, ring buffer, and matching engine:
@@ -242,10 +237,10 @@ Run a live end-to-end simulation through the market feed, shared-memory IPC, rin
 python -m chronosmatch.dashboard --orders 5000 --rate 2000 --mode POISSON
 ```
 
-#### 2. Standalone Demo Mode
-Run continuous synthetic market flow without pipeline allocation:
+#### 2. Standalone Demo Mode with Curses Backend
+Run continuous synthetic market flow with Python Curses rendering:
 ```bash
-python -m chronosmatch.dashboard --demo --refresh 0.25
+python -m chronosmatch.dashboard --demo --refresh 0.25 --backend curses
 ```
 
 #### 3. Single-Snapshot Inspection
@@ -262,8 +257,10 @@ python -m chronosmatch.dashboard --once
 | `--mode` | | `POISSON` | Simulator traffic pattern (`POISSON`, `UNIFORM`, `BURST`, `MAX_THROUGHPUT`). |
 | `--capacity` | | `1024` | Ring buffer slot capacity (must be a power of two). |
 | `--refresh` | `-r` | `0.5` | UI refresh interval in seconds. |
+| `--backend` | | `ansi` (Win) / `auto` | Terminal backend selection: `ansi`, `curses`, or `auto`. |
+| `--whale-threshold` | | `1000` | Minimum contract quantity threshold for Whale Order detection. |
 | `--wal` | | `None` | Optional path to Write-Ahead Log for persistent audit logging. |
-| `--cython` | | `False` | Use compiled Cython matching engine if available. |
+| `--cython` | | `True` | Automatically uses compiled Cython engine with Python fallback. |
 | `--demo` | | `False` | Run in standalone demo simulation mode. |
 | `--once` | | `False` | Render a single snapshot and exit immediately. |
 | `--plain` | | `False` | Disable cursor escape sequences and stream plain text frames. |
