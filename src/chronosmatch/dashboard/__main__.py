@@ -52,6 +52,25 @@ from chronosmatch.pipeline import (
 )
 
 
+def _parse_rate_arg(val: Any) -> tuple[float, SimulationMode | None]:
+    """Parse rate argument supporting numeric values or 'max'."""
+    if isinstance(val, (int, float)):
+        f_val = float(val)
+        if f_val <= 0:
+            return float("inf"), SimulationMode.MAX_THROUGHPUT
+        return f_val, None
+    s = str(val).strip().lower()
+    if s in ("max", "max_throughput", "infinite", "inf"):
+        return float("inf"), SimulationMode.MAX_THROUGHPUT
+    try:
+        f_val = float(s)
+        if f_val <= 0:
+            return float("inf"), SimulationMode.MAX_THROUGHPUT
+        return f_val, None
+    except ValueError:
+        return 2000.0, None
+
+
 def _run_demo_producer(
     collector: DashboardMetricsCollector,
     stop_event: Any,
@@ -101,17 +120,22 @@ def main(argv: list[str] | None = None) -> int:
         description="ChronosMatch Real-Time Terminal Telemetry Dashboard",
     )
     parser.add_argument(
+        "--continuous",
+        "-c",
+        action="store_true",
+        help="Run continuous live market simulation until interrupted (Ctrl+C)",
+    )
+    parser.add_argument(
         "--orders",
         "-n",
         type=int,
         default=5_000,
-        help="Total orders to simulate and match through the pipeline (default: 5,000)",
+        help="Total orders to simulate and match through the pipeline (default: 5,000; set to 0 or use -c for continuous)",
     )
     parser.add_argument(
         "--rate",
-        type=float,
-        default=2_000.0,
-        help="Target synthetic order generation rate in ops/sec (default: 2,000)",
+        default="2000",
+        help="Target synthetic order generation rate in ops/sec (e.g. 1000, 10000, 50000, 100000, or 'max') (default: 2,000)",
     )
     parser.add_argument(
         "--mode",
@@ -246,10 +270,18 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write("Note: Native Cython extension not compiled. Falling back to pure Python MatchingEngine.\n")
             engine = MatchingEngine()
 
-    sim_mode = SimulationMode(args.mode)
+    is_continuous = args.continuous or (args.orders <= 0)
+    total_orders = None if is_continuous else args.orders
+
+    parsed_rate, forced_mode = _parse_rate_arg(args.rate)
+    if forced_mode is not None:
+        sim_mode = forced_mode
+    else:
+        sim_mode = SimulationMode(args.mode)
+
     config = MarketFeedConfig(
-        total_orders=args.orders,
-        rate=args.rate,
+        total_orders=total_orders,
+        rate=parsed_rate,
         mode=sim_mode,
         whale_order_threshold=args.whale_threshold,
     )
@@ -271,12 +303,18 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        runner.run(total_orders=args.orders)
+        runner.run(total_orders=total_orders)
     except KeyboardInterrupt:
-        sys.stdout.write("\nChronosMatch Pipeline interrupted by user.\n")
+        if is_continuous:
+            sys.stdout.write("\nChronosMatch continuous simulation interrupted by user (Ctrl+C).\n")
+        else:
+            sys.stdout.write("\nChronosMatch Pipeline interrupted by user.\n")
     finally:
         runner.close()
-        sys.stdout.write("\nChronosMatch Pipeline & Dashboard finished cleanly.\n")
+        if is_continuous:
+            sys.stdout.write("\nChronosMatch Continuous Live Simulation stopped cleanly.\n")
+        else:
+            sys.stdout.write("\nChronosMatch Pipeline & Dashboard finished cleanly.\n")
 
     return 0
 

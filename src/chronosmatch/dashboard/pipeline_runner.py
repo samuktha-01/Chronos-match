@@ -300,6 +300,10 @@ class PipelineDashboardRunner:
         try:
             metrics = self._pipeline.run_sync(total_orders=total_orders)
             return metrics
+        except KeyboardInterrupt:
+            self._pipeline.stop()
+            self._pipeline.drain_all_pending()
+            return self._pipeline.metrics
         finally:
             # Render final state to capture terminal completion snapshot
             try:
@@ -321,6 +325,10 @@ class PipelineDashboardRunner:
         try:
             metrics = await self._pipeline.run_async(total_orders=total_orders)
             return metrics
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            self._pipeline.stop()
+            self._pipeline.drain_all_pending()
+            return self._pipeline.metrics
         finally:
             # Render final state to capture terminal completion snapshot
             try:
@@ -328,6 +336,10 @@ class PipelineDashboardRunner:
             except Exception:
                 pass
             self._dashboard.stop()
+
+    def run_continuous(self) -> TradingPipelineMetrics:
+        """Run continuous live market simulation until interrupted (e.g. via Ctrl+C)."""
+        return self.run(total_orders=None)
 
     def run_steps(self, count: int) -> list[Trade]:
         """Execute a deterministic number of simulated orders through the pipeline.
@@ -370,6 +382,10 @@ class PipelineDashboardRunner:
         """Stop the running pipeline and dashboard background thread."""
         try:
             self._pipeline.stop()
+        except Exception:
+            pass
+        try:
+            self._pipeline.drain_all_pending()
         except Exception:
             pass
         self._dashboard.stop()

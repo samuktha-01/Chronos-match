@@ -132,11 +132,18 @@ class MatchingEngine:
         - Any unfilled balance of the incoming order rests in the Limit Order Book.
     """
 
-    __slots__ = ("order_book", "_trade_counter", "_trades")
+    __slots__ = ("order_book", "_trade_counter", "_trades", "_total_volume_traded", "_max_retained_trades")
 
-    def __init__(self, order_book: LimitOrderBook | None = None) -> None:
+    def __init__(
+        self,
+        order_book: LimitOrderBook | None = None,
+        *,
+        max_retained_trades: int | None = None,
+    ) -> None:
         self.order_book: LimitOrderBook = order_book if order_book is not None else LimitOrderBook()
         self._trade_counter: int = 0
+        self._total_volume_traded: int = 0
+        self._max_retained_trades: int | None = max_retained_trades
         self._trades: list[Trade] = []
 
     def _validate_order(self, order: Any) -> None:
@@ -200,6 +207,7 @@ class MatchingEngine:
             exec_price = maker_order.price
 
             self._trade_counter += 1
+            self._total_volume_traded += match_qty
             trade = Trade(
                 trade_id=self._trade_counter,
                 resting_order_id=maker_order.order_id,
@@ -210,6 +218,8 @@ class MatchingEngine:
             )
             trades.append(trade)
             self._trades.append(trade)
+            if self._max_retained_trades is not None and len(self._trades) > self._max_retained_trades:
+                self._trades.pop(0)
 
             remaining_qty -= match_qty
 

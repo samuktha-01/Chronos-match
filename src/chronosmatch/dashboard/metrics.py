@@ -302,6 +302,9 @@ class DashboardMetricsSnapshot:
     multi_level_sweeps: int | None = None
     whale_order_threshold: int | None = None
     last_whale_order: dict[str, Any] | None = None
+    target_generation_rate: float | None = None
+    generated_orders_per_sec: float | None = None
+    published_orders_per_sec: float | None = None
     is_cython_accelerated: bool = False
     source_name: str = "ChronosMatch"
 
@@ -313,6 +316,9 @@ class DashboardMetricsSnapshot:
             "elapsed_seconds": self.elapsed_seconds,
             "throughput_orders_per_sec": self.throughput_orders_per_sec,
             "window_throughput_orders_per_sec": self.window_throughput_orders_per_sec,
+            "target_generation_rate": self.target_generation_rate,
+            "generated_orders_per_sec": self.generated_orders_per_sec,
+            "published_orders_per_sec": self.published_orders_per_sec,
             "orders_generated": self.orders_generated,
             "orders_published": self.orders_published,
             "orders_consumed": self.orders_consumed,
@@ -429,6 +435,9 @@ class DashboardMetricsCollector:
         # Sliding-window throughput tracking
         self._prev_snapshot_time_ns: int | None = None
         self._prev_processed_orders: int | None = None
+        self._prev_generated_orders: int | None = None
+        self._prev_published_orders: int | None = None
+        self._manual_target_generation_rate: float | None = None
 
         # Manual / standalone counter overrides (None indicates metric is unavailable)
         self._manual_orders_generated: int | None = None
@@ -514,6 +523,13 @@ class DashboardMetricsCollector:
             self._stop_time_ns = None
             self._prev_snapshot_time_ns = None
             self._prev_processed_orders = None
+            self._prev_generated_orders = None
+            self._prev_published_orders = None
+
+    def set_target_generation_rate(self, rate: float | None) -> None:
+        """Explicitly configure the target order generation rate."""
+        with self._lock:
+            self._manual_target_generation_rate = rate
 
     # --------------------------------------------------------------------------
     # Manual Event Recording (Standalone Mode)
@@ -684,14 +700,21 @@ class DashboardMetricsCollector:
             # Backward-compatible alias pointing to core matching latency
             latency_result = core_result
 
-            # 8. Throughput Calculations
+            # 8. Throughput & Rate Calculations
             throughput = self._compute_cumulative_throughput(proc_orders, elapsed_sec)
             win_throughput = self._compute_window_throughput(proc_orders, now_perf_ns)
+            gen_rate = self._compute_rate(gen_orders, self._prev_generated_orders, elapsed_sec, now_perf_ns)
+            pub_rate = self._compute_rate(pub_orders, self._prev_published_orders, elapsed_sec, now_perf_ns)
+            target_rate = self._resolve_target_generation_rate()
 
             # Update window state
             if proc_orders is not None:
                 self._prev_processed_orders = proc_orders
-                self._prev_snapshot_time_ns = now_perf_ns
+            if gen_orders is not None:
+                self._prev_generated_orders = gen_orders
+            if pub_orders is not None:
+                self._prev_published_orders = pub_orders
+            self._prev_snapshot_time_ns = now_perf_ns
             # 9. Acceleration Status
             is_cython = False
             if self._pipeline is not None and hasattr(self._pipeline, "is_cython_accelerated"):
@@ -744,6 +767,9 @@ class DashboardMetricsCollector:
                 multi_level_sweeps=whale_sweeps,
                 whale_order_threshold=whale_thresh,
                 last_whale_order=last_whale,
+                target_generation_rate=target_rate,
+                generated_orders_per_sec=gen_rate,
+                published_orders_per_sec=pub_rate,
                 is_cython_accelerated=is_cython,
                 source_name=self.source_name,
             )
@@ -797,6 +823,56 @@ class DashboardMetricsCollector:
         if delta_seconds <= 1e-6 or delta_orders < 0:
             return 0.0
         return float(delta_orders) / delta_seconds
+
+    def _compute_rate(
+        self,
+        current_count: int | None,
+        prev_count: int | None,
+        elapsed_sec: float | None,
+        now_ns: int,
+    ) -> float | None:
+        if current_count is None:
+            return None
+        if prev_count is not None and self._prev_snapshot_time_ns is not None:
+            delta_seconds = (now_ns - self._prev_snapshot_time_ns) / 1_000_000_000.0
+            if delta_seconds >= 0.05:
+                delta_orders = current_count - prev_count
+                if delta_orders >= 0:
+                    return float(delta_orders) / delta_seconds
+        if elapsed_sec is not None:
+            if elapsed_sec <= 1e-6:
+                return 0.0
+            return float(current_count) / elapsed_sec
+        return None
+
+    def _resolve_target_generation_rate(self) -> float | None:
+        if self._pipeline is not None and hasattr(self._pipeline, "config") and self._pipeline.config is not None:
+            pm = getattr(self._pipeline, "metrics", None)
+            sim = getattr(self._pipeline, "simulator", getattr(self._pipeline, "_simulator", None))
+            has_sim = (
+                (pm is not None and getattr(pm, "orders_generated", 0) > 0)
+                or (sim is not None and getattr(sim, "is_running", False))
+                or (sim is not None and getattr(getattr(sim, "metrics", None), "orders_generated", 0) > 0)
+            )
+            if has_sim:
+                cfg = self._pipeline.config
+                mode = getattr(cfg, "mode", None)
+                if mode is not None and str(mode).upper().endswith("MAX_THROUGHPUT"):
+                    return float("inf")
+                rate = getattr(cfg, "orders_per_second", None) or getattr(cfg, "rate", None)
+                if rate is not None:
+                    return float(rate)
+        if self._simulator is not None and hasattr(self._simulator, "config") and self._simulator.config is not None:
+            sim_m = getattr(self._simulator, "metrics", None)
+            if getattr(self._simulator, "is_running", False) or (sim_m is not None and getattr(sim_m, "orders_generated", 0) > 0):
+                cfg = self._simulator.config
+                mode = getattr(cfg, "mode", None)
+                if mode is not None and str(mode).upper().endswith("MAX_THROUGHPUT"):
+                    return float("inf")
+                rate = getattr(cfg, "orders_per_second", None) or getattr(cfg, "rate", None)
+                if rate is not None:
+                    return float(rate)
+        return self._manual_target_generation_rate
 
     def _resolve_orders_generated(self) -> int | None:
         if self._pipeline is not None and hasattr(self._pipeline, "metrics"):

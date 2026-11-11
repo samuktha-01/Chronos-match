@@ -417,11 +417,36 @@ class CursesRenderer:
         cur_y += 1
 
         # Section 2: Order Flow & Pipeline Status
-        if cur_y + 6 < max_y:
+        has_rate_info = snapshot.target_generation_rate is not None
+        extra_rows = 2 if (has_rate_info and snapshot.published_orders_per_sec is not None) else (1 if has_rate_info else 0)
+        if cur_y + 6 + extra_rows < max_y:
             safe_addstr(win, cur_y, start_x, h_border, theme.gray())
             cur_y += 1
             self._draw_section_header(win, cur_y, start_x, width, "ORDER FLOW & PIPELINE STATUS")
             cur_y += 1
+            if has_rate_info:
+                target_str = (
+                    "MAX_THROUGHPUT"
+                    if snapshot.target_generation_rate is not None and math.isinf(snapshot.target_generation_rate)
+                    else (f"{snapshot.target_generation_rate:,.0f} ops/s" if snapshot.target_generation_rate is not None else "N/A")
+                )
+                self._draw_two_col(
+                    win, cur_y, start_x, width,
+                    "Target Rate", target_str,
+                    "Actual Gen. Rate", format_rate(snapshot.generated_orders_per_sec, self._ansi_styler),
+                    val1_attr=theme.cyan(bold=True) if snapshot.target_generation_rate is not None else theme.gray(),
+                    val2_attr=theme.green(bold=True) if (snapshot.generated_orders_per_sec or 0) > 0 else theme.normal(),
+                )
+                cur_y += 1
+                if snapshot.published_orders_per_sec is not None:
+                    self._draw_two_col(
+                        win, cur_y, start_x, width,
+                        "Published Rate", format_rate(snapshot.published_orders_per_sec, self._ansi_styler),
+                        "Backpressure Evt", format_int(snapshot.backpressure_events, self._ansi_styler, default="0"),
+                        val1_attr=theme.green(bold=True) if (snapshot.published_orders_per_sec or 0) > 0 else theme.normal(),
+                        val2_attr=theme.red(bold=True) if (snapshot.backpressure_events or 0) > 0 else theme.green(),
+                    )
+                    cur_y += 1
             self._draw_two_col(
                 win, cur_y, start_x, width,
                 "Orders Generated", format_int(snapshot.orders_generated, self._ansi_styler),
@@ -445,7 +470,14 @@ class CursesRenderer:
             self._draw_two_col(
                 win, cur_y, start_x, width,
                 "Orders Processed", format_int(snapshot.orders_processed, self._ansi_styler),
-                "Backpressure Evt", format_int(snapshot.backpressure_events, self._ansi_styler, default="0"),
+                "Backpressure Evt" if snapshot.published_orders_per_sec is None else "Drop Rate",
+                format_int(snapshot.backpressure_events, self._ansi_styler, default="0")
+                if snapshot.published_orders_per_sec is None
+                else (
+                    f"{(snapshot.orders_dropped / snapshot.orders_generated * 100):.2f}%"
+                    if snapshot.orders_dropped and snapshot.orders_generated
+                    else "0.00%"
+                ),
                 val2_attr=theme.red(bold=True) if (snapshot.backpressure_events or 0) > 0 else theme.green(),
             )
             cur_y += 1

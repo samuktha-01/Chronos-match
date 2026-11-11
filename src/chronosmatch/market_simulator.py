@@ -133,6 +133,19 @@ class SimulatorMetrics:
             return 0.0
         return self.orders_published / elapsed
 
+    @property
+    def generated_rate(self) -> float:
+        """Orders generated per second."""
+        elapsed = self.elapsed_seconds
+        if elapsed <= 0.0:
+            return 0.0
+        return self.orders_generated / elapsed
+
+    @property
+    def published_rate(self) -> float:
+        """Orders successfully published per second (alias for effective_rate)."""
+        return self.effective_rate
+
     def to_dict(self) -> dict[str, Any]:
         """Convert metrics to a diagnostic dictionary."""
         return {
@@ -148,6 +161,8 @@ class SimulatorMetrics:
             "total_backpressure_wait_seconds": self.total_backpressure_wait_seconds,
             "elapsed_seconds": self.elapsed_seconds,
             "effective_rate": self.effective_rate,
+            "generated_rate": self.generated_rate,
+            "published_rate": self.published_rate,
             "start_time_ns": self.start_time_ns,
             "stop_time_ns": self.stop_time_ns,
             "wall_start_time_ns": self.wall_start_time_ns,
@@ -248,6 +263,11 @@ class MarketFeedConfig:
     backpressure_timeout: float | None = 5.0
     backpressure_poll_interval: float = 0.001
 
+    @property
+    def orders_per_second(self) -> float:
+        """Target orders per second (alias for rate)."""
+        return self.rate
+
     def __post_init__(self) -> None:
         """Validate all configuration attributes strictly."""
         self._validate_identifiers()
@@ -288,7 +308,9 @@ class MarketFeedConfig:
     def _validate_rate(self) -> None:
         if isinstance(self.rate, bool) or not isinstance(self.rate, (int, float)):
             raise SimulatorConfigError(f"rate must be a number, got {type(self.rate).__name__}")
-        if not math.isfinite(self.rate) or self.rate <= 0:
+        if self.mode == SimulationMode.MAX_THROUGHPUT and (math.isinf(self.rate) or self.rate > 0):
+            pass
+        elif not math.isfinite(self.rate) or self.rate <= 0:
             raise SimulatorConfigError(f"rate must be finite and strictly positive (> 0), got {self.rate}")
 
         if self.total_orders is not None:
@@ -587,9 +609,19 @@ class MarketSimulator:
                 price = self._quantize_price(min(self._max_price, ref_ask + depth_steps))
             self.metrics.passive_orders += 1
 
-        # Quantize quantity with step size
-        step_idx = self._rng.randint(0, self._quantity_steps) if self._quantity_steps > 0 else 0
-        quantity = self.config.min_quantity + step_idx * self.config.quantity_step
+        # Quantize quantity with step size, with ~1% probability of generating a whale order if max_quantity allows
+        if (
+            self.config.whale_order_threshold is not None
+            and self.config.max_quantity >= self.config.whale_order_threshold
+            and self._rng.random() < 0.01
+        ):
+            quantity = self._rng.randint(
+                self.config.whale_order_threshold,
+                self.config.max_quantity,
+            )
+        else:
+            step_idx = self._rng.randint(0, self._quantity_steps) if self._quantity_steps > 0 else 0
+            quantity = self.config.min_quantity + step_idx * self.config.quantity_step
 
         self._sequence_number += 1
         order_id = f"{self.config.order_prefix}_{self._sequence_number:010d}"
@@ -819,6 +851,15 @@ class MarketSimulator:
         self.metrics.start_time_ns = time.perf_counter_ns()
         count = 0
 
+        target_rate = float(self.config.rate)
+        use_micro_pacing = target_rate >= 500.0 and self.config.mode in (
+            SimulationMode.UNIFORM,
+            SimulationMode.POISSON,
+            SimulationMode.BURST,
+        )
+        pacing_start = time.perf_counter()
+        pacing_count = 0
+
         try:
             while not self._stop_event.is_set():
                 if self.config.total_orders is not None and count >= self.config.total_orders:
@@ -871,11 +912,30 @@ class MarketSimulator:
                     elif hasattr(target_engine, "add_order"):
                         target_engine.add_order(order)
 
-                delay = self.next_inter_arrival_time()
-                if delay > 0.0:
-                    await asyncio.sleep(delay)
-                elif count & 31 == 0:
-                    await asyncio.sleep(0)
+                if use_micro_pacing:
+                    pacing_count += 1
+                    target_time = pacing_start + (pacing_count / target_rate)
+                    now = time.perf_counter()
+                    lead = target_time - now
+
+                    if lead > 0.002:
+                        await asyncio.sleep(lead - 0.001)
+                    elif lead > 0:
+                        if pacing_count & 31 == 0:
+                            await asyncio.sleep(0)
+                    else:
+                        if pacing_count & 63 == 0:
+                            await asyncio.sleep(0)
+                        if -lead > 0.1:
+                            # Reset pacing reference after backpressure wait or OS stall
+                            pacing_start = time.perf_counter()
+                            pacing_count = 0
+                else:
+                    delay = self.next_inter_arrival_time()
+                    if delay > 0.0:
+                        await asyncio.sleep(delay)
+                    elif count & 31 == 0:
+                        await asyncio.sleep(0)
 
         except asyncio.CancelledError:
             self._stop_event.set()

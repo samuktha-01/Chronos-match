@@ -649,7 +649,7 @@ class TradingPipeline:
         # Concurrent consumer draining coroutine with batched draining
         async def _consumer_loop() -> None:
             processed = 0
-            batch_limit = 64
+            batch_limit = 128
             while not self._stop_event.is_set() or not self._consumer.is_empty:
                 if target_count is not None and processed >= target_count:
                     break
@@ -697,7 +697,7 @@ class TradingPipeline:
                 if batch_count == 0:
                     if self._stop_event.is_set() and self._consumer.is_empty:
                         break
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(0.0001)
                 else:
                     await asyncio.sleep(0)
 
@@ -794,6 +794,17 @@ class TradingPipeline:
                 if ttt_stats.sample_count > 0:
                     self.metrics.tick_to_trade_latency = ttt_stats
 
+            if self._wal is not None:
+                try:
+                    self._wal.flush()
+                except Exception:
+                    pass
+            if self._trade_store is not None:
+                try:
+                    self._trade_store.flush()
+                except Exception:
+                    pass
+
         return self.metrics
 
     def run_sync(self, total_orders: int | None = None) -> TradingPipelineMetrics:
@@ -811,6 +822,26 @@ class TradingPipeline:
     def stop(self) -> None:
         """Signal the asynchronous pipeline tasks to stop."""
         self._stop_event.set()
+        if hasattr(self, "_simulator") and self._simulator is not None:
+            try:
+                self._simulator.stop()
+            except Exception:
+                pass
+
+    def drain_all_pending(self) -> int:
+        """Drain all pending unconsumed orders from the ring buffer and flush persistence."""
+        count = self.drain_consumer()
+        if self._wal is not None:
+            try:
+                self._wal.flush()
+            except Exception:
+                pass
+        if self._trade_store is not None:
+            try:
+                self._trade_store.flush()
+            except Exception:
+                pass
+        return count
 
     def close(self) -> None:
         """Close producer, consumer, and ring buffer handles."""

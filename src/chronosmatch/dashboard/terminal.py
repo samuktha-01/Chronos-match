@@ -219,6 +219,16 @@ def format_rate(rate: float | None, styler: AnsiStyler, default: str = "N/A") ->
     return styler.green(val_str) if styler.enabled and rate > 0 else val_str
 
 
+def format_target_rate(rate: float | None, styler: AnsiStyler, default: str = "N/A") -> str:
+    """Format target synthetic order generation rate or return default."""
+    if rate is None:
+        return styler.gray(default)
+    if math.isinf(rate):
+        return styler.cyan("MAX_THROUGHPUT") if styler.enabled else "MAX_THROUGHPUT"
+    val_str = f"{rate:,.0f} ops/s"
+    return styler.cyan(val_str) if styler.enabled else val_str
+
+
 def format_time(seconds: float | None, styler: AnsiStyler, default: str = "N/A") -> str:
     """Format elapsed seconds as HH:MM:SS.mmm or MM:SS.mmm or return default."""
     if seconds is None:
@@ -638,38 +648,124 @@ class DashboardRenderer:
         # ----------------------------------------------------------------------
         lines.append(self._divider())
         lines.append(self._section_header("ORDER FLOW & PIPELINE STATUS"))
-        lines.append(
-            self._two_col_row(
-                "Orders Generated",
-                format_int(snapshot.orders_generated, styler),
-                "Orders Cancelled",
-                format_int(snapshot.orders_cancelled, styler),
+        if snapshot.target_generation_rate is not None:
+            lines.append(
+                self._two_col_row(
+                    "Target Rate",
+                    format_target_rate(snapshot.target_generation_rate, styler),
+                    "Actual Gen. Rate",
+                    format_rate(snapshot.generated_orders_per_sec, styler),
+                )
             )
-        )
-        lines.append(
-            self._two_col_row(
-                "Orders Published",
-                format_int(snapshot.orders_published, styler),
-                "Orders Dropped",
-                format_counter_with_alert(snapshot.orders_dropped, styler),
+            if snapshot.published_orders_per_sec is not None:
+                lines.append(
+                    self._two_col_row(
+                        "Published Rate",
+                        format_rate(snapshot.published_orders_per_sec, styler),
+                        "Orders Cancelled",
+                        format_int(snapshot.orders_cancelled, styler),
+                    )
+                )
+                lines.append(
+                    self._two_col_row(
+                        "Orders Generated",
+                        format_int(snapshot.orders_generated, styler),
+                        "Orders Dropped",
+                        format_counter_with_alert(snapshot.orders_dropped, styler),
+                    )
+                )
+                lines.append(
+                    self._two_col_row(
+                        "Orders Published",
+                        format_int(snapshot.orders_published, styler),
+                        "Processing Errors",
+                        format_counter_with_alert(snapshot.processing_errors, styler),
+                    )
+                )
+                lines.append(
+                    self._two_col_row(
+                        "Orders Consumed",
+                        format_int(snapshot.orders_consumed, styler),
+                        "Backpressure Evt",
+                        format_counter_with_alert(snapshot.backpressure_events, styler),
+                    )
+                )
+                lines.append(
+                    self._two_col_row(
+                        "Orders Processed",
+                        format_int(snapshot.orders_processed, styler),
+                        "Drop Rate",
+                        f"{(snapshot.orders_dropped / snapshot.orders_generated * 100):.2f}%"
+                        if (snapshot.orders_dropped and snapshot.orders_generated)
+                        else "0.00%",
+                    )
+                )
+            else:
+                lines.append(
+                    self._two_col_row(
+                        "Orders Generated",
+                        format_int(snapshot.orders_generated, styler),
+                        "Orders Cancelled",
+                        format_int(snapshot.orders_cancelled, styler),
+                    )
+                )
+                lines.append(
+                    self._two_col_row(
+                        "Orders Published",
+                        format_int(snapshot.orders_published, styler),
+                        "Orders Dropped",
+                        format_counter_with_alert(snapshot.orders_dropped, styler),
+                    )
+                )
+                lines.append(
+                    self._two_col_row(
+                        "Orders Consumed",
+                        format_int(snapshot.orders_consumed, styler),
+                        "Processing Errors",
+                        format_counter_with_alert(snapshot.processing_errors, styler),
+                    )
+                )
+                lines.append(
+                    self._two_col_row(
+                        "Orders Processed",
+                        format_int(snapshot.orders_processed, styler),
+                        "Backpressure Evt",
+                        format_counter_with_alert(snapshot.backpressure_events, styler),
+                    )
+                )
+        else:
+            lines.append(
+                self._two_col_row(
+                    "Orders Generated",
+                    format_int(snapshot.orders_generated, styler),
+                    "Orders Cancelled",
+                    format_int(snapshot.orders_cancelled, styler),
+                )
             )
-        )
-        lines.append(
-            self._two_col_row(
-                "Orders Consumed",
-                format_int(snapshot.orders_consumed, styler),
-                "Processing Errors",
-                format_counter_with_alert(snapshot.processing_errors, styler),
+            lines.append(
+                self._two_col_row(
+                    "Orders Published",
+                    format_int(snapshot.orders_published, styler),
+                    "Orders Dropped",
+                    format_counter_with_alert(snapshot.orders_dropped, styler),
+                )
             )
-        )
-        lines.append(
-            self._two_col_row(
-                "Orders Processed",
-                format_int(snapshot.orders_processed, styler),
-                "Backpressure Evt",
-                format_counter_with_alert(snapshot.backpressure_events, styler),
+            lines.append(
+                self._two_col_row(
+                    "Orders Consumed",
+                    format_int(snapshot.orders_consumed, styler),
+                    "Processing Errors",
+                    format_counter_with_alert(snapshot.processing_errors, styler),
+                )
             )
-        )
+            lines.append(
+                self._two_col_row(
+                    "Orders Processed",
+                    format_int(snapshot.orders_processed, styler),
+                    "Backpressure Evt",
+                    format_counter_with_alert(snapshot.backpressure_events, styler),
+                )
+            )
 
         # ----------------------------------------------------------------------
         # 3. Trade Executions & Market State
