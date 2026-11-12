@@ -467,18 +467,19 @@ class CursesRenderer:
                 val2_attr=theme.red(bold=True) if (snapshot.processing_errors or 0) > 0 else theme.green(),
             )
             cur_y += 1
+            health_str = f"PROD:{'OK' if snapshot.producer_healthy else 'ERR'} CONS:{'OK' if snapshot.consumer_healthy else 'ERR'}"
             self._draw_two_col(
                 win, cur_y, start_x, width,
                 "Orders Processed", format_int(snapshot.orders_processed, self._ansi_styler),
-                "Backpressure Evt" if snapshot.published_orders_per_sec is None else "Drop Rate",
+                "Backpressure Evt" if snapshot.published_orders_per_sec is None else "Pipeline Health",
                 format_int(snapshot.backpressure_events, self._ansi_styler, default="0")
                 if snapshot.published_orders_per_sec is None
-                else (
-                    f"{(snapshot.orders_dropped / snapshot.orders_generated * 100):.2f}%"
-                    if snapshot.orders_dropped and snapshot.orders_generated
-                    else "0.00%"
+                else health_str,
+                val2_attr=(
+                    theme.red(bold=True)
+                    if (snapshot.backpressure_events or 0) > 0 and snapshot.published_orders_per_sec is None
+                    else (theme.green() if (snapshot.producer_healthy and snapshot.consumer_healthy) else theme.red(bold=True))
                 ),
-                val2_attr=theme.red(bold=True) if (snapshot.backpressure_events or 0) > 0 else theme.green(),
             )
             cur_y += 1
 
@@ -754,10 +755,13 @@ class CursesRenderer:
     def _resolve_status(self, snapshot: DashboardMetricsSnapshot, override: str | None) -> tuple[str, int]:
         if override is not None:
             return override, self.theme.cyan(bold=True)
+        if snapshot.is_stopped:
+            return "STOPPED", self.theme.red(bold=True)
         if snapshot.elapsed_seconds is None:
             return "IDLE", self.theme.yellow()
         if (snapshot.throughput_orders_per_sec or 0) > 0 or (snapshot.orders_processed or 0) > 0:
-            return "ACTIVE", self.theme.green(bold=True)
+            status_text = "RUNNING" if snapshot.target_generation_rate is not None else "ACTIVE"
+            return status_text, self.theme.green(bold=True)
         return "READY", self.theme.cyan()
 
     def _render_small_terminal(self, win: Any, max_y: int, max_x: int) -> None:

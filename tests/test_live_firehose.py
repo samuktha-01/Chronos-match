@@ -265,21 +265,37 @@ class TestContinuousDashboardTelemetry:
 
         collector.record_order_generated(10_000)
         collector.record_order_published(9_950)
+        collector.record_order_consumed(9_920)
         collector.record_order_processed(9_900)
 
         snap1 = collector.take_snapshot()
         assert snap1.target_generation_rate == 100_000.0
         assert snap1.orders_generated == 10_000
         assert snap1.orders_published == 9_950
+        assert snap1.orders_consumed == 9_920
         assert snap1.orders_processed == 9_900
         assert snap1.generated_orders_per_sec is not None
         assert snap1.published_orders_per_sec is not None
+        assert snap1.consumed_orders_per_sec is not None
+        assert snap1.processed_orders_per_sec is not None
+        assert snap1.producer_healthy is True
+        assert snap1.consumer_healthy is True
+        assert snap1.is_stopped is False
 
         # Verify to_dict includes new fields
         d = snap1.to_dict()
         assert d["target_generation_rate"] == 100_000.0
         assert d["generated_orders_per_sec"] == snap1.generated_orders_per_sec
         assert d["published_orders_per_sec"] == snap1.published_orders_per_sec
+        assert d["consumed_orders_per_sec"] == snap1.consumed_orders_per_sec
+        assert d["processed_orders_per_sec"] == snap1.processed_orders_per_sec
+        assert d["producer_healthy"] is True
+        assert d["consumer_healthy"] is True
+        assert d["is_stopped"] is False
+
+        # Verify stopped status setting
+        collector.set_stopped(True)
+        assert collector.take_snapshot().is_stopped is True
 
     def test_renderer_displays_target_and_generated_rates(self) -> None:
         """Verify DashboardRenderer displays Target Rate, Actual Gen. Rate, and Published Rate in Section 2."""
@@ -301,11 +317,20 @@ class TestContinuousDashboardTelemetry:
         assert "Orders Published:" in rendered
         assert "Orders Consumed:" in rendered
         assert "Orders Processed:" in rendered
+        assert "Pipeline Health:" in rendered
+        assert "PROD:OK" in rendered
+        assert "CONS:OK" in rendered
         assert "Backpressure Evt:" in rendered
+        assert "Status: RUNNING" in rendered
 
         # Verify all lines have exactly the configured width
         for line_idx, line in enumerate(rendered.splitlines()):
             assert len(line) == 80, f"Line {line_idx} width is {len(line)}, expected 80: '{line}'"
+
+        # Verify stopped status rendering
+        collector.set_stopped(True)
+        rendered_stopped = renderer.render(collector.take_snapshot())
+        assert "Status: STOPPED" in rendered_stopped
 
     def test_max_throughput_target_rate_formatting(self) -> None:
         """Verify MAX_THROUGHPUT target rate renders as 'MAX_THROUGHPUT'."""

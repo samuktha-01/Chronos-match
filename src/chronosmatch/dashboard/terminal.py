@@ -440,6 +440,9 @@ class DashboardRenderer:
 
     def _resolve_status_string(self, snapshot: DashboardMetricsSnapshot) -> str:
         """Determine human-readable processing status from snapshot telemetry."""
+        if snapshot.is_stopped:
+            status_text = "STOPPED"
+            return self.styler.bold(self.styler.red(status_text)) if self.styler.enabled else status_text
         if snapshot.elapsed_seconds is None:
             status_text = "IDLE"
             return self.styler.yellow(status_text) if self.styler.enabled else status_text
@@ -453,7 +456,7 @@ class DashboardRenderer:
         )
 
         if has_throughput or has_processed:
-            status_text = "ACTIVE"
+            status_text = "RUNNING" if snapshot.target_generation_rate is not None else "ACTIVE"
             return self.styler.bold(self.styler.green(status_text)) if self.styler.enabled else status_text
 
         status_text = "READY"
@@ -690,14 +693,18 @@ class DashboardRenderer:
                         format_counter_with_alert(snapshot.backpressure_events, styler),
                     )
                 )
+                health_val = (
+                    f"{styler.green('PROD:OK') if snapshot.producer_healthy else styler.red('PROD:ERR')} "
+                    f"{styler.green('CONS:OK') if snapshot.consumer_healthy else styler.red('CONS:ERR')}"
+                    if styler.enabled
+                    else f"PROD:{'OK' if snapshot.producer_healthy else 'ERR'} CONS:{'OK' if snapshot.consumer_healthy else 'ERR'}"
+                )
                 lines.append(
                     self._two_col_row(
                         "Orders Processed",
                         format_int(snapshot.orders_processed, styler),
-                        "Drop Rate",
-                        f"{(snapshot.orders_dropped / snapshot.orders_generated * 100):.2f}%"
-                        if (snapshot.orders_dropped and snapshot.orders_generated)
-                        else "0.00%",
+                        "Pipeline Health",
+                        health_val,
                     )
                 )
             else:

@@ -899,9 +899,19 @@ class TradingPipeline:
         return self._producer
 
     @property
+    def producer_healthy(self) -> bool:
+        """True if producer is open and ring buffer is available."""
+        return not self._is_closed and hasattr(self, "_producer") and not getattr(self._producer, "is_closed", False)
+
+    @property
     def consumer(self) -> OrderConsumer:
         """OrderConsumer interface."""
         return self._consumer
+
+    @property
+    def consumer_healthy(self) -> bool:
+        """True if consumer is open and ring buffer is available."""
+        return not self._is_closed and hasattr(self, "_consumer") and not getattr(self._consumer, "is_closed", False)
 
     @property
     def simulator(self) -> MarketSimulator:

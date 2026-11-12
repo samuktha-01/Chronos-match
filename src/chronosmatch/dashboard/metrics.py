@@ -305,6 +305,11 @@ class DashboardMetricsSnapshot:
     target_generation_rate: float | None = None
     generated_orders_per_sec: float | None = None
     published_orders_per_sec: float | None = None
+    consumed_orders_per_sec: float | None = None
+    processed_orders_per_sec: float | None = None
+    producer_healthy: bool = True
+    consumer_healthy: bool = True
+    is_stopped: bool = False
     is_cython_accelerated: bool = False
     source_name: str = "ChronosMatch"
 
@@ -319,6 +324,11 @@ class DashboardMetricsSnapshot:
             "target_generation_rate": self.target_generation_rate,
             "generated_orders_per_sec": self.generated_orders_per_sec,
             "published_orders_per_sec": self.published_orders_per_sec,
+            "consumed_orders_per_sec": self.consumed_orders_per_sec,
+            "processed_orders_per_sec": self.processed_orders_per_sec,
+            "producer_healthy": self.producer_healthy,
+            "consumer_healthy": self.consumer_healthy,
+            "is_stopped": self.is_stopped,
             "orders_generated": self.orders_generated,
             "orders_published": self.orders_published,
             "orders_consumed": self.orders_consumed,
@@ -437,7 +447,11 @@ class DashboardMetricsCollector:
         self._prev_processed_orders: int | None = None
         self._prev_generated_orders: int | None = None
         self._prev_published_orders: int | None = None
+        self._prev_consumed_orders: int | None = None
         self._manual_target_generation_rate: float | None = None
+        self._manual_producer_healthy: bool | None = None
+        self._manual_consumer_healthy: bool | None = None
+        self._manual_is_stopped: bool | None = None
 
         # Manual / standalone counter overrides (None indicates metric is unavailable)
         self._manual_orders_generated: int | None = None
@@ -525,11 +539,23 @@ class DashboardMetricsCollector:
             self._prev_processed_orders = None
             self._prev_generated_orders = None
             self._prev_published_orders = None
+            self._prev_consumed_orders = None
 
     def set_target_generation_rate(self, rate: float | None) -> None:
         """Explicitly configure the target order generation rate."""
         with self._lock:
             self._manual_target_generation_rate = rate
+
+    def set_stopped(self, stopped: bool = True) -> None:
+        """Explicitly set whether the simulation is stopped."""
+        with self._lock:
+            self._manual_is_stopped = stopped
+
+    def set_health(self, *, producer: bool = True, consumer: bool = True) -> None:
+        """Explicitly configure producer and consumer health flags for standalone testing."""
+        with self._lock:
+            self._manual_producer_healthy = producer
+            self._manual_consumer_healthy = consumer
 
     # --------------------------------------------------------------------------
     # Manual Event Recording (Standalone Mode)
@@ -705,7 +731,11 @@ class DashboardMetricsCollector:
             win_throughput = self._compute_window_throughput(proc_orders, now_perf_ns)
             gen_rate = self._compute_rate(gen_orders, self._prev_generated_orders, elapsed_sec, now_perf_ns)
             pub_rate = self._compute_rate(pub_orders, self._prev_published_orders, elapsed_sec, now_perf_ns)
+            con_rate = self._compute_rate(con_orders, self._prev_consumed_orders, elapsed_sec, now_perf_ns)
+            proc_rate = win_throughput if win_throughput is not None else throughput
             target_rate = self._resolve_target_generation_rate()
+            prod_ok, cons_ok = self._resolve_health()
+            is_stopped = self._resolve_is_stopped()
 
             # Update window state
             if proc_orders is not None:
@@ -714,6 +744,8 @@ class DashboardMetricsCollector:
                 self._prev_generated_orders = gen_orders
             if pub_orders is not None:
                 self._prev_published_orders = pub_orders
+            if con_orders is not None:
+                self._prev_consumed_orders = con_orders
             self._prev_snapshot_time_ns = now_perf_ns
             # 9. Acceleration Status
             is_cython = False
@@ -770,6 +802,11 @@ class DashboardMetricsCollector:
                 target_generation_rate=target_rate,
                 generated_orders_per_sec=gen_rate,
                 published_orders_per_sec=pub_rate,
+                consumed_orders_per_sec=con_rate,
+                processed_orders_per_sec=proc_rate,
+                producer_healthy=prod_ok,
+                consumer_healthy=cons_ok,
+                is_stopped=is_stopped,
                 is_cython_accelerated=is_cython,
                 source_name=self.source_name,
             )
@@ -873,6 +910,35 @@ class DashboardMetricsCollector:
                 if rate is not None:
                     return float(rate)
         return self._manual_target_generation_rate
+
+    def _resolve_health(self) -> tuple[bool, bool]:
+        prod_ok = True if self._manual_producer_healthy is None else self._manual_producer_healthy
+        cons_ok = True if self._manual_consumer_healthy is None else self._manual_consumer_healthy
+        if self._pipeline is not None:
+            if hasattr(self._pipeline, "producer_healthy"):
+                prod_ok = bool(self._pipeline.producer_healthy)
+            elif hasattr(self._pipeline, "is_closed"):
+                prod_ok = not self._pipeline.is_closed
+            if hasattr(self._pipeline, "consumer_healthy"):
+                cons_ok = bool(self._pipeline.consumer_healthy)
+            elif hasattr(self._pipeline, "is_closed"):
+                cons_ok = not self._pipeline.is_closed
+        return prod_ok, cons_ok
+
+    def _resolve_is_stopped(self) -> bool:
+        if self._manual_is_stopped is not None:
+            return self._manual_is_stopped
+        if self._pipeline is not None:
+            if getattr(self._pipeline, "is_closed", False):
+                return True
+            stop_evt = getattr(self._pipeline, "_stop_event", None)
+            if stop_evt is not None and stop_evt.is_set():
+                return True
+        if self._simulator is not None:
+            sim_m = getattr(self._simulator, "metrics", None)
+            if not getattr(self._simulator, "is_running", True) and sim_m is not None and getattr(sim_m, "orders_generated", 0) > 0:
+                return True
+        return False
 
     def _resolve_orders_generated(self) -> int | None:
         if self._pipeline is not None and hasattr(self._pipeline, "metrics"):

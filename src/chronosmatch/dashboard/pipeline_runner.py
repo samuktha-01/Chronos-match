@@ -305,6 +305,8 @@ class PipelineDashboardRunner:
             self._pipeline.drain_all_pending()
             return self._pipeline.metrics
         finally:
+            if hasattr(self._collector, "set_stopped"):
+                self._collector.set_stopped(True)
             # Render final state to capture terminal completion snapshot
             try:
                 self._dashboard.render_once()
@@ -330,6 +332,8 @@ class PipelineDashboardRunner:
             self._pipeline.drain_all_pending()
             return self._pipeline.metrics
         finally:
+            if hasattr(self._collector, "set_stopped"):
+                self._collector.set_stopped(True)
             # Render final state to capture terminal completion snapshot
             try:
                 self._dashboard.render_once()
@@ -388,6 +392,8 @@ class PipelineDashboardRunner:
             self._pipeline.drain_all_pending()
         except Exception:
             pass
+        if hasattr(self._collector, "set_stopped"):
+            self._collector.set_stopped(True)
         self._dashboard.stop()
 
     def close(self) -> None:
