@@ -313,8 +313,6 @@ def main(argv: list[str] | None = None) -> int:
         runner.close()
         if is_continuous:
             sys.stdout.write("\nChronosMatch Continuous Live Simulation stopped cleanly.\n")
-        else:
-            sys.stdout.write("\nChronosMatch Pipeline & Dashboard finished cleanly.\n")
 
     return 0
 
