@@ -204,6 +204,17 @@ def main(argv: list[str] | None = None) -> int:
         default="ansi" if os.name == "nt" else "auto",
         help="Terminal UI rendering backend ('ansi', 'curses', or 'auto'). Default is 'ansi' on Windows.",
     )
+    parser.add_argument(
+        "--ipc-target",
+        type=float,
+        default=100_000.0,
+        help="Target IPC throughput requirement in orders/sec (default: 100,000)",
+    )
+    parser.add_argument(
+        "--no-ipc-monitor",
+        action="store_true",
+        help="Disable dedicated 100K IPC monitoring section in dashboard",
+    )
 
     args = parser.parse_args(argv)
 
@@ -214,6 +225,9 @@ def main(argv: list[str] | None = None) -> int:
     # Single-shot execution
     if args.once:
         collector = DashboardMetricsCollector(source_name="ChronosMatch Snapshot")
+        if not args.no_ipc_monitor:
+            collector.enable_ipc_monitoring(True)
+            collector.set_ipc_target(args.ipc_target)
         dashboard = create_dashboard(
             collector=collector,
             backend=args.backend,
@@ -221,6 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             use_colors=not args.no_color,
             use_unicode=False if args.ascii else None,
             fallback_to_ansi=True,
+            show_ipc_section=not args.no_ipc_monitor,
         )
         dashboard.render_once()
         return 0
@@ -228,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
     # Demo simulation mode (standalone)
     if args.demo:
         collector = DashboardMetricsCollector(source_name="ChronosMatch Demo")
+        if not args.no_ipc_monitor:
+            collector.enable_ipc_monitoring(True)
+            collector.set_ipc_target(args.ipc_target)
         collector.start()
         stop_event = threading.Event()
         demo_thread = threading.Thread(
@@ -246,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             use_unicode=False if args.ascii else None,
             clear_screen=not args.plain,
             fallback_to_ansi=True,
+            show_ipc_section=not args.no_ipc_monitor,
         )
 
         try:
@@ -300,6 +319,8 @@ def main(argv: list[str] | None = None) -> int:
         use_colors=not args.no_color,
         use_unicode=False if args.ascii else None,
         backend=args.backend,
+        enable_ipc_monitoring=not args.no_ipc_monitor,
+        ipc_target_ops_per_sec=args.ipc_target,
     )
 
     try:

@@ -160,6 +160,8 @@ class PipelineDashboardRunner:
         instrument_latency: bool = True,
         source_name: str | None = None,
         backend: str | DashboardBackend | None = None,
+        enable_ipc_monitoring: bool = True,
+        ipc_target_ops_per_sec: float = 100_000.0,
     ) -> None:
         """Initialize PipelineDashboardRunner.
 
@@ -174,6 +176,8 @@ class PipelineDashboardRunner:
             instrument_latency: If True, enables latency instrumentation.
             source_name: Descriptive name for reporting (defaults to engine mode name).
             backend: Dashboard rendering backend ('ansi', 'curses', or 'auto'). Defaults to ANSI on Windows.
+            enable_ipc_monitoring: If True, enables dedicated 100K IPC monitoring section.
+            ipc_target_ops_per_sec: Target IPC operations/sec (defaults to 100,000.0).
         """
         self._owns_pipeline: bool = pipeline is None
         self._pipeline: TradingPipeline = pipeline if pipeline is not None else create_pipeline()
@@ -222,6 +226,10 @@ class PipelineDashboardRunner:
             source_name=resolved_source,
         )
 
+        if enable_ipc_monitoring:
+            self._collector.enable_ipc_monitoring(True)
+            self._collector.set_ipc_target(ipc_target_ops_per_sec)
+
         resolved_backend = resolve_backend(backend, stream=output, fallback_to_ansi=True)
         self._resolved_backend: DashboardBackend = resolved_backend
 
@@ -231,6 +239,7 @@ class PipelineDashboardRunner:
                 refresh_interval=refresh_interval,
                 on_exit=self.stop,
                 stream=output,
+                show_ipc_section=enable_ipc_monitoring,
             )
         else:
             self._dashboard = TerminalDashboard(
@@ -241,6 +250,7 @@ class PipelineDashboardRunner:
                 use_unicode=use_unicode,
                 width=width,
                 output=output,
+                show_ipc_section=enable_ipc_monitoring,
             )
 
     @property
@@ -433,6 +443,8 @@ def run_pipeline_with_dashboard(
     use_unicode: bool | None = None,
     output: TextIO | None = None,
     backend: str | DashboardBackend | None = None,
+    enable_ipc_monitoring: bool = True,
+    ipc_target_ops_per_sec: float = 100_000.0,
 ) -> TradingPipelineMetrics:
     """Run a ChronosMatch TradingPipeline with live TerminalDashboard telemetry.
 
@@ -468,6 +480,8 @@ def run_pipeline_with_dashboard(
         use_unicode=use_unicode,
         output=output,
         backend=backend,
+        enable_ipc_monitoring=enable_ipc_monitoring,
+        ipc_target_ops_per_sec=ipc_target_ops_per_sec,
     )
 
     try:

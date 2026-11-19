@@ -323,6 +323,87 @@ def format_utilization_bar(
         return f"[{colored_bar}] {styler.bold(styler.red(pct_str))}"
 
 
+def format_target_progress_bar(
+    achieved_pct: float | None,
+    current_rate: float | None,
+    target_rate: float,
+    width: int,
+    box: BoxStyle,
+    styler: AnsiStyler,
+    default: str = "N/A",
+) -> str:
+    """Format a graphical progress bar for the 100K IPC target achievement."""
+    if achieved_pct is None:
+        raw = f"[{box.gauge_empty * width}] {default}"
+        return styler.gray(raw) if styler.enabled else raw
+
+    clamped_ratio = max(0.0, min(1.0, float(achieved_pct) / 100.0))
+    filled = int(round(clamped_ratio * width))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+    pct_str = f"{achieved_pct:5.2f}%"
+
+    cur_str = f"{current_rate:,.0f}" if current_rate is not None else "0"
+    tgt_str = f"{target_rate:,.0f}"
+    rate_desc = f"({cur_str}/{tgt_str} ops/s)"
+
+    if not styler.enabled:
+        bar_chars = box.gauge_full * filled + box.gauge_empty * empty
+        return f"[{bar_chars}] {pct_str} {rate_desc}"
+
+    if achieved_pct >= 100.0:
+        bar = styler.bold(styler.green(box.gauge_full * filled))
+        return f"[{bar}] {styler.bold(styler.green(pct_str))} {rate_desc}"
+    elif achieved_pct >= 50.0:
+        bar = styler.cyan(box.gauge_full * filled) + styler.gray(box.gauge_empty * empty)
+        return f"[{bar}] {styler.cyan(pct_str)} {rate_desc}"
+    else:
+        bar = styler.yellow(box.gauge_full * filled) + styler.gray(box.gauge_empty * empty)
+        return f"[{bar}] {styler.yellow(pct_str)} {rate_desc}"
+
+
+def format_ipc_rate(
+    rate: float | None,
+    styler: AnsiStyler,
+    target: float = 100_000.0,
+    default: str = "N/A",
+) -> str:
+    """Format IPC rate with color coding: green if >= 100K, yellow if >= 50K, red if < 50K."""
+    if rate is None:
+        return styler.gray(default)
+    val_str = f"{rate:,.1f} ops/s"
+    if not styler.enabled:
+        return val_str
+    if rate >= target:
+        return styler.bold(styler.green(val_str))
+    elif rate >= (target * 0.5):
+        return styler.yellow(val_str)
+    elif rate > 0.0:
+        return styler.red(val_str)
+    return styler.gray(val_str)
+
+
+def format_pct(
+    pct: float | None,
+    styler: AnsiStyler,
+    target_pct: float = 100.0,
+    default: str = "N/A",
+) -> str:
+    """Format percentage with color coding relative to target percentage."""
+    if pct is None:
+        return styler.gray(default)
+    pct_str = f"{pct:.2f}%"
+    if not styler.enabled:
+        return pct_str
+    if pct >= target_pct:
+        return styler.bold(styler.green(pct_str))
+    elif pct >= (target_pct * 0.5):
+        return styler.yellow(pct_str)
+    elif pct > 0.0:
+        return styler.red(pct_str)
+    return styler.gray(pct_str)
+
+
 def format_wall_time(wall_ns: int) -> str:
     """Format high-resolution wall timestamp to UTC date and time string."""
     secs = wall_ns / 1_000_000_000.0
@@ -360,6 +441,7 @@ class DashboardRenderer:
         use_unicode: bool = True,
         width: int = 80,
         show_depth_ladder: bool | None = None,
+        show_ipc_section: bool | None = None,
     ) -> None:
         """Initialize DashboardRenderer.
 
@@ -368,11 +450,13 @@ class DashboardRenderer:
             use_unicode: If True, use Unicode box characters. If False, use standard ASCII.
             width: Total terminal column width (minimum 74).
             show_depth_ladder: Explicit toggle for Level 2 order book depth ladder.
+            show_ipc_section: Explicit toggle for 100K IPC requirement and telemetry section.
         """
         self.use_colors = use_colors
         self.use_unicode = use_unicode
         self.width = max(74, width)
         self.show_depth_ladder = show_depth_ladder
+        self.show_ipc_section = show_ipc_section
         self.styler = AnsiStyler(enabled=use_colors)
         self.box = UNICODE_BOX if use_unicode else ASCII_BOX
 
@@ -569,6 +653,183 @@ class DashboardRenderer:
 
             row_text = f"{left_col} {box.vertical} {right_col}"
             lines.append(self._pad_row(row_text))
+
+        return lines
+
+    def _render_ipc_section(self, snapshot: DashboardMetricsSnapshot) -> list[str]:
+        """Render dedicated 100K IPC requirement and throughput telemetry section."""
+        styler = self.styler
+        box = self.box
+        lines: list[str] = []
+
+        # Section header with optional warning badge
+        extra_badge = ""
+        if snapshot.ipc_warning:
+            extra_badge = (
+                styler.bold(styler.red(f"(! {snapshot.ipc_warning} !)"))
+                if styler.enabled
+                else f"(! {snapshot.ipc_warning} !)"
+            )
+        lines.append(self._section_header("100K IPC TARGET & TELEMETRY MONITORING", extra_badge))
+
+        # Target progress bar
+        bar_width = 18
+        progress_str = format_target_progress_bar(
+            snapshot.ipc_target_achieved_pct,
+            snapshot.published_orders_per_sec,
+            snapshot.ipc_target_ops_per_sec,
+            bar_width,
+            box,
+            styler,
+        )
+        lines.append(self._pad_row(f"  Target Progress:    {progress_str}"))
+
+        # Sustained status
+        if snapshot.ipc_sustained_status:
+            raw_status = snapshot.ipc_sustained_status
+            if styler.enabled:
+                if "SUSTAINED" in raw_status:
+                    status_styled = styler.bold(styler.green(raw_status))
+                elif "BURST" in raw_status:
+                    status_styled = styler.bold(styler.yellow(raw_status))
+                else:
+                    status_styled = styler.red(raw_status)
+            else:
+                status_styled = raw_status
+        else:
+            status_styled = styler.gray("N/A")
+        lines.append(self._pad_row(f"  Sustained Status:   {status_styled}"))
+
+        # Target and Throughput Rates
+        lines.append(
+            self._two_col_row(
+                "Required IPC Target",
+                f"{snapshot.ipc_target_ops_per_sec:,.0f} ops/s",
+                "Target Achieved",
+                format_pct(snapshot.ipc_target_achieved_pct, styler),
+            )
+        )
+        lines.append(
+            self._two_col_row(
+                "Published IPC Rate",
+                format_ipc_rate(snapshot.published_orders_per_sec, styler, snapshot.ipc_target_ops_per_sec),
+                "Actual Gen. Rate",
+                format_rate(snapshot.generated_orders_per_sec, styler),
+            )
+        )
+        lines.append(
+            self._two_col_row(
+                "Consumed IPC Rate",
+                format_rate(snapshot.consumed_orders_per_sec, styler),
+                "Processing Rate",
+                format_rate(snapshot.processed_orders_per_sec, styler),
+            )
+        )
+        lines.append(
+            self._two_col_row(
+                "1s Window Rate",
+                format_ipc_rate(snapshot.ipc_current_window_rate, styler, snapshot.ipc_target_ops_per_sec),
+                "5s Rolling Avg Rate",
+                format_ipc_rate(snapshot.ipc_rolling_avg_rate, styler, snapshot.ipc_target_ops_per_sec),
+            )
+        )
+        lines.append(
+            self._two_col_row(
+                "Min Rate (1s Win)",
+                format_ipc_rate(snapshot.ipc_min_rate, styler, snapshot.ipc_target_ops_per_sec),
+                "Max Rate (1s Win)",
+                format_ipc_rate(snapshot.ipc_max_rate, styler, snapshot.ipc_target_ops_per_sec),
+            )
+        )
+
+        # Buffer Health Telemetry
+        cap_str = (
+            f"{snapshot.ring_buffer_capacity:,} slots"
+            if snapshot.ring_buffer_capacity is not None
+            else styler.gray("N/A")
+        )
+        occ_val = snapshot.ring_buffer_occupied
+        occ_pct = snapshot.ring_buffer_occupancy_pct
+        if occ_val is not None and occ_pct is not None:
+            occ_str = f"{occ_val:,} ({occ_pct:.1f}%)"
+            if styler.enabled and occ_pct >= 80.0:
+                occ_str = styler.bold(styler.red(occ_str))
+            elif styler.enabled and occ_pct >= 50.0:
+                occ_str = styler.yellow(occ_str)
+        elif occ_val is not None:
+            occ_str = f"{occ_val:,}"
+        else:
+            occ_str = styler.gray("N/A")
+
+        lines.append(
+            self._two_col_row(
+                "Ring Buffer Capacity",
+                cap_str,
+                "Current Occupancy",
+                occ_str,
+            )
+        )
+        lines.append(
+            self._two_col_row(
+                "Failed Publications",
+                format_counter_with_alert(snapshot.failed_publications, styler),
+                "Dropped Orders",
+                format_counter_with_alert(snapshot.orders_dropped, styler),
+            )
+        )
+
+        # IPC Latencies (Dwell vs Core)
+        dwell = snapshot.queue_dwell_latency
+        core = snapshot.core_latency
+        lines.append(
+            self._two_col_row(
+                "Dwell Latency (p50)",
+                format_latency(dwell.p50_us if dwell else None, styler, box.micro),
+                "Matching Lat. (p50)",
+                format_latency(core.p50_us if core else None, styler, box.micro),
+            )
+        )
+        lines.append(
+            self._two_col_row(
+                "Dwell Latency (p95)",
+                format_latency(dwell.p95_us if dwell else None, styler, box.micro),
+                "Matching Lat. (p95)",
+                format_latency(core.p95_us if core else None, styler, box.micro),
+            )
+        )
+        lines.append(
+            self._two_col_row(
+                "Dwell Latency (p99)",
+                format_latency(dwell.p99_us if dwell else None, styler, box.micro),
+                "Matching Lat. (p99)",
+                format_latency(core.p99_us if core else None, styler, box.micro),
+            )
+        )
+
+        # System Health & Resources
+        health_summary = (
+            f"{snapshot.producer_status} {snapshot.consumer_status} {snapshot.matching_engine_status}"
+        )
+        if (
+            snapshot.cpu_percent is not None
+            and snapshot.memory_mb is not None
+        ):
+            res_str = f"{snapshot.cpu_percent:.1f}% / {snapshot.memory_mb:.1f} MB"
+        elif snapshot.cpu_percent is not None:
+            res_str = f"{snapshot.cpu_percent:.1f}% / N/A"
+        elif snapshot.memory_mb is not None:
+            res_str = f"N/A / {snapshot.memory_mb:.1f} MB"
+        else:
+            res_str = styler.gray("N/A")
+
+        lines.append(
+            self._two_col_row(
+                "Component Health",
+                health_summary,
+                "CPU / Memory",
+                res_str,
+            )
+        )
 
         return lines
 
@@ -773,6 +1034,17 @@ class DashboardRenderer:
                     format_counter_with_alert(snapshot.backpressure_events, styler),
                 )
             )
+
+        # ----------------------------------------------------------------------
+        # Dedicated 100K IPC Performance Section
+        # ----------------------------------------------------------------------
+        render_ipc = (
+            self.show_ipc_section is True
+            or (self.show_ipc_section is None and snapshot.ipc_monitoring_enabled)
+        )
+        if render_ipc:
+            lines.append(self._divider())
+            lines.extend(self._render_ipc_section(snapshot))
 
         # ----------------------------------------------------------------------
         # 3. Trade Executions & Market State
@@ -1162,6 +1434,8 @@ class TerminalDashboard:
         output: TextIO | None = None,
         clear_screen: bool = True,
         on_render: Callable[[DashboardMetricsSnapshot, str], None] | None = None,
+        show_depth_ladder: bool | None = None,
+        show_ipc_section: bool | None = None,
     ) -> None:
         """Initialize TerminalDashboard.
 
@@ -1176,6 +1450,8 @@ class TerminalDashboard:
             output: Output stream (defaults to sys.stdout).
             clear_screen: If True in interactive mode, homes/clears terminal before overwriting.
             on_render: Optional callback invoked with `(snapshot, rendered_string)` after each frame.
+            show_depth_ladder: Explicit toggle for Level 2 order book depth ladder.
+            show_ipc_section: Explicit toggle for 100K IPC requirement and telemetry section.
 
         Raises:
             ValueError: If refresh_interval <= 0.
@@ -1207,6 +1483,8 @@ class TerminalDashboard:
             use_colors=self._use_colors,
             use_unicode=self._use_unicode,
             width=self._width,
+            show_depth_ladder=show_depth_ladder,
+            show_ipc_section=show_ipc_section,
         )
 
         self._stop_event = threading.Event()

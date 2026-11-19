@@ -325,9 +325,14 @@ class CursesRenderer:
     MIN_WIDTH: int = 68
     MIN_HEIGHT: int = 16
 
-    def __init__(self, theme: CursesColorTheme | None = None) -> None:
+    def __init__(
+        self,
+        theme: CursesColorTheme | None = None,
+        show_ipc_section: bool | None = None,
+    ) -> None:
         self.theme: CursesColorTheme = theme if theme is not None else CursesColorTheme()
         self._ansi_styler: AnsiStyler = AnsiStyler(enabled=False)
+        self.show_ipc_section: bool | None = show_ipc_section
 
     def render(
         self,
@@ -482,6 +487,14 @@ class CursesRenderer:
                 ),
             )
             cur_y += 1
+
+        # Dedicated IPC Section (if enabled)
+        render_ipc = (
+            self.show_ipc_section is True
+            or (self.show_ipc_section is None and snapshot.ipc_monitoring_enabled)
+        )
+        if render_ipc and cur_y + 8 < max_y:
+            cur_y = self._draw_ipc_section(win, cur_y, start_x, width, max_y, snapshot)
 
         # Section 3: Trade Executions & Market State
         if cur_y + 5 < max_y:
@@ -690,6 +703,144 @@ class CursesRenderer:
         footer = "  [q] Quit   [r] Refresh   [Ctrl+C] Exit   |   ChronosMatch Curses UI"
         safe_addstr(win, cur_y, start_x, footer.ljust(width), theme.gray())
 
+    def _draw_ipc_section(
+        self,
+        win: Any,
+        cur_y: int,
+        start_x: int,
+        width: int,
+        max_y: int,
+        snapshot: DashboardMetricsSnapshot,
+    ) -> int:
+        theme = self.theme
+        h_border = "+" + "-" * (width - 2) + "+"
+
+        if cur_y >= max_y - 2:
+            return cur_y
+
+        safe_addstr(win, cur_y, start_x, h_border, theme.gray())
+        cur_y += 1
+
+        warn_badge = f"(! {snapshot.ipc_warning} !)" if snapshot.ipc_warning else ""
+        self._draw_section_header(
+            win, cur_y, start_x, width,
+            "100K IPC TARGET & TELEMETRY MONITORING",
+            extra=warn_badge,
+            attr=theme.yellow(bold=True) if snapshot.ipc_warning else theme.cyan(bold=True),
+        )
+        cur_y += 1
+
+        # Progress bar
+        achieved = snapshot.ipc_target_achieved_pct
+        pub_rate = snapshot.published_orders_per_sec or 0.0
+        tgt_rate = snapshot.ipc_target_ops_per_sec
+        bar_len = 16
+        if achieved is not None:
+            clamped = max(0.0, min(1.0, achieved / 100.0))
+            filled = int(round(clamped * bar_len))
+            bar_chars = "#" * filled + "." * (bar_len - filled)
+            pct_text = f"{achieved:5.2f}%"
+            rate_text = f"({pub_rate:,.0f}/{tgt_rate:,.0f} ops/s)"
+            prog_text = f"  Target Progress:    [{bar_chars}] {pct_text} {rate_text}"
+            bar_attr = theme.green(bold=True) if achieved >= 100.0 else (theme.cyan() if achieved >= 50.0 else theme.yellow())
+        else:
+            prog_text = f"  Target Progress:    [{'.' * bar_len}] N/A"
+            bar_attr = theme.gray()
+
+        if cur_y < max_y - 1:
+            safe_addstr(win, cur_y, start_x, "|", theme.gray())
+            safe_addstr(win, cur_y, start_x + 1, prog_text.ljust(width - 2), bar_attr)
+            safe_addstr(win, cur_y, start_x + width - 1, "|", theme.gray())
+            cur_y += 1
+
+        # Sustained status
+        if snapshot.ipc_sustained_status and cur_y < max_y - 1:
+            st_text = f"  Sustained Status:   {snapshot.ipc_sustained_status}"
+            if "SUSTAINED" in snapshot.ipc_sustained_status:
+                st_attr = theme.green(bold=True)
+            elif "BURST" in snapshot.ipc_sustained_status:
+                st_attr = theme.yellow(bold=True)
+            else:
+                st_attr = theme.red(bold=True)
+            safe_addstr(win, cur_y, start_x, "|", theme.gray())
+            safe_addstr(win, cur_y, start_x + 1, st_text.ljust(width - 2), st_attr)
+            safe_addstr(win, cur_y, start_x + width - 1, "|", theme.gray())
+            cur_y += 1
+
+        # Target & Rates
+        if cur_y < max_y - 1:
+            ach_str = f"{snapshot.ipc_target_achieved_pct:.2f}%" if snapshot.ipc_target_achieved_pct is not None else "N/A"
+            self._draw_two_col(
+                win, cur_y, start_x, width,
+                "Required IPC Target", f"{tgt_rate:,.0f} ops/s",
+                "Target Achieved", ach_str,
+                val2_attr=theme.green(bold=True) if (snapshot.ipc_target_achieved_pct or 0.0) >= 100.0 else theme.yellow(),
+            )
+            cur_y += 1
+
+        if cur_y < max_y - 1:
+            pub_str = f"{pub_rate:,.1f} ops/s" if snapshot.published_orders_per_sec is not None else "N/A"
+            gen_rate = snapshot.generated_orders_per_sec
+            gen_str = f"{gen_rate:,.1f} ops/s" if gen_rate is not None else "N/A"
+            self._draw_two_col(
+                win, cur_y, start_x, width,
+                "Published IPC Rate", pub_str,
+                "Actual Gen. Rate", gen_str,
+                val1_attr=theme.green(bold=True) if pub_rate >= tgt_rate else (theme.yellow() if pub_rate >= tgt_rate * 0.5 else theme.normal()),
+                val2_attr=theme.green(bold=True) if (gen_rate or 0) > 0 else theme.normal(),
+            )
+            cur_y += 1
+
+        if cur_y < max_y - 1:
+            r1 = f"{snapshot.ipc_current_window_rate:,.1f} ops/s" if snapshot.ipc_current_window_rate is not None else "N/A"
+            r5 = f"{snapshot.ipc_rolling_avg_rate:,.1f} ops/s" if snapshot.ipc_rolling_avg_rate is not None else "N/A"
+            self._draw_two_col(
+                win, cur_y, start_x, width,
+                "1s Window Rate", r1,
+                "5s Rolling Avg Rate", r5,
+                val1_attr=theme.green(bold=True) if (snapshot.ipc_current_window_rate or 0) >= tgt_rate else theme.normal(),
+                val2_attr=theme.green(bold=True) if (snapshot.ipc_rolling_avg_rate or 0) >= tgt_rate else theme.normal(),
+            )
+            cur_y += 1
+
+        if cur_y < max_y - 1:
+            failed_str = format_int(snapshot.failed_publications, self._ansi_styler, default="0")
+            occ_pct = snapshot.ring_buffer_occupancy_pct
+            occ_str = f"{occ_pct:.1f}%" if occ_pct is not None else "N/A"
+            self._draw_two_col(
+                win, cur_y, start_x, width,
+                "Failed Publications", failed_str,
+                "Buffer Occupancy", occ_str,
+                val1_attr=theme.red(bold=True) if (snapshot.failed_publications or 0) > 0 else theme.green(),
+                val2_attr=theme.red(bold=True) if (occ_pct or 0) >= 80.0 else theme.green(),
+            )
+            cur_y += 1
+
+        if cur_y < max_y - 1:
+            dwell = snapshot.queue_dwell_latency
+            core = snapshot.core_latency
+            d_p50 = format_latency(dwell.p50_us if dwell else None, self._ansi_styler, micro_unit="us")
+            c_p50 = format_latency(core.p50_us if core else None, self._ansi_styler, micro_unit="us")
+            self._draw_two_col(
+                win, cur_y, start_x, width,
+                "Dwell Latency (p50)", d_p50,
+                "Matching Lat. (p50)", c_p50,
+            )
+            cur_y += 1
+
+        if cur_y < max_y - 1:
+            h_str = f"{snapshot.producer_status} {snapshot.consumer_status} {snapshot.matching_engine_status}"
+            res_str = f"{snapshot.cpu_percent:.1f}% / {snapshot.memory_mb:.1f} MB" if (snapshot.cpu_percent is not None and snapshot.memory_mb is not None) else "N/A"
+            self._draw_two_col(
+                win, cur_y, start_x, width,
+                "Component Health", h_str,
+                "CPU / Memory", res_str,
+                val1_attr=theme.green() if ("ERR" not in h_str and "DEGRADED" not in h_str) else theme.red(bold=True),
+            )
+            cur_y += 1
+
+        return cur_y
+
     def _draw_section_header(
         self,
         win: Any,
@@ -819,6 +970,7 @@ class CursesDashboard:
         on_render: Callable[[DashboardMetricsSnapshot, str], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         stream: TextIO | None = None,
+        show_ipc_section: bool | None = None,
     ) -> None:
         """Initialize CursesDashboard.
 
@@ -828,6 +980,7 @@ class CursesDashboard:
             on_render: Optional callback invoked with `(snapshot, rendered_string)` after each frame.
             on_exit: Optional callback invoked when the user requests keyboard exit ('q' / 'ESC').
             stream: Target output stream for TTY checking (defaults to sys.stdout).
+            show_ipc_section: Explicit toggle for 100K IPC requirement and telemetry section.
 
         Raises:
             ValueError: If refresh_interval <= 0.
@@ -842,7 +995,7 @@ class CursesDashboard:
         self._stream = stream if stream is not None else sys.stdout
 
         self._theme = CursesColorTheme()
-        self._renderer = CursesRenderer(theme=self._theme)
+        self._renderer = CursesRenderer(theme=self._theme, show_ipc_section=show_ipc_section)
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1167,6 +1320,7 @@ def create_dashboard(
     on_render: Callable[[DashboardMetricsSnapshot, str], None] | None = None,
     on_exit: Callable[[], None] | None = None,
     fallback_to_ansi: bool = True,
+    show_ipc_section: bool | None = None,
 ) -> TerminalDashboard | CursesDashboard:
     """Instantiate a dashboard controller with the resolved backend.
 
@@ -1186,6 +1340,7 @@ def create_dashboard(
         on_render: Optional callback invoked with `(snapshot, rendered_string)` after each frame.
         on_exit: Optional callback invoked on user exit request.
         fallback_to_ansi: If True, falls back to ANSI when CURSES is unavailable.
+        show_ipc_section: Explicit toggle for 100K IPC requirement and telemetry section.
 
     Returns:
         Configured TerminalDashboard or CursesDashboard instance.
@@ -1198,6 +1353,7 @@ def create_dashboard(
             on_render=on_render,
             on_exit=on_exit,
             stream=output,
+            show_ipc_section=show_ipc_section,
         )
     return TerminalDashboard(
         collector=collector,
@@ -1209,4 +1365,5 @@ def create_dashboard(
         output=output,
         clear_screen=clear_screen,
         on_render=on_render,
+        show_ipc_section=show_ipc_section,
     )

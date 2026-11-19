@@ -312,6 +312,23 @@ class DashboardMetricsSnapshot:
     is_stopped: bool = False
     is_cython_accelerated: bool = False
     source_name: str = "ChronosMatch"
+    # 100K IPC Requirement & Telemetry
+    ipc_target_ops_per_sec: float = 100_000.0
+    ipc_target_achieved_pct: float | None = None
+    ipc_current_window_rate: float | None = None
+    ipc_rolling_avg_rate: float | None = None
+    ipc_min_rate: float | None = None
+    ipc_max_rate: float | None = None
+    ipc_sustained_status: str | None = None
+    ring_buffer_occupancy_pct: float | None = None
+    failed_publications: int | None = None
+    producer_status: str = "PROD:OK"
+    consumer_status: str = "CONS:OK"
+    matching_engine_status: str = "MATCH:OK"
+    cpu_percent: float | None = None
+    memory_mb: float | None = None
+    ipc_warning: str | None = None
+    ipc_monitoring_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert snapshot to a serializable diagnostic dictionary."""
@@ -365,6 +382,22 @@ class DashboardMetricsSnapshot:
             "last_whale_order": self.last_whale_order,
             "is_cython_accelerated": self.is_cython_accelerated,
             "source_name": self.source_name,
+            "ipc_target_ops_per_sec": self.ipc_target_ops_per_sec,
+            "ipc_target_achieved_pct": self.ipc_target_achieved_pct,
+            "ipc_current_window_rate": self.ipc_current_window_rate,
+            "ipc_rolling_avg_rate": self.ipc_rolling_avg_rate,
+            "ipc_min_rate": self.ipc_min_rate,
+            "ipc_max_rate": self.ipc_max_rate,
+            "ipc_sustained_status": self.ipc_sustained_status,
+            "ring_buffer_occupancy_pct": self.ring_buffer_occupancy_pct,
+            "failed_publications": self.failed_publications,
+            "producer_status": self.producer_status,
+            "consumer_status": self.consumer_status,
+            "matching_engine_status": self.matching_engine_status,
+            "cpu_percent": self.cpu_percent,
+            "memory_mb": self.memory_mb,
+            "ipc_warning": self.ipc_warning,
+            "ipc_monitoring_enabled": self.ipc_monitoring_enabled,
         }
 
 
@@ -400,6 +433,8 @@ class DashboardMetricsCollector:
         tick_to_trade_tracker: BoundedLatencyTracker | None = None,
         whale_threshold: int | None = None,
         source_name: str = "ChronosMatch",
+        enable_ipc_monitoring: bool = False,
+        ipc_target: float = 100_000.0,
     ) -> None:
         """Initialize DashboardMetricsCollector.
 
@@ -414,9 +449,23 @@ class DashboardMetricsCollector:
             tick_to_trade_tracker: Optional BoundedLatencyTracker for end-to-end tick-to-trade latency (T3 - T0).
             whale_threshold: Optional whale order threshold for anomaly detection.
             source_name: Descriptive name for diagnostic reporting.
+            enable_ipc_monitoring: If True, activates real-time 100K IPC requirement monitoring.
+            ipc_target: Target IPC throughput in orders/sec (default: 100,000).
         """
         self.source_name = source_name
         self.whale_threshold = whale_threshold
+        self._enable_ipc_monitoring: bool = enable_ipc_monitoring
+        self._ipc_target_ops_per_sec: float = float(ipc_target)
+        self._published_rate_samples: collections.deque[tuple[int, float]] = collections.deque()
+        self._min_observed_published_rate: float | None = None
+        self._max_observed_published_rate: float | None = None
+        self._manual_failed_publications: int | None = None
+        self._manual_ipc_warning: str | None = None
+        self._manual_cpu_percent: float | None = None
+        self._manual_memory_mb: float | None = None
+        self._cached_cpu: float | None = None
+        self._cached_mem: float | None = None
+        self._last_resource_sample_ns: int = 0
         self._pipeline = pipeline
         self._engine = engine
         self._ring_buffer = ring_buffer
@@ -472,6 +521,8 @@ class DashboardMetricsCollector:
         self._manual_last_whale_order: dict[str, Any] | None = None
         self._manual_bids_depth: list[tuple[float | int | Decimal, int]] | None = None
         self._manual_asks_depth: list[tuple[float | int | Decimal, int]] | None = None
+        self._manual_rb_capacity: int | None = None
+        self._manual_rb_occupied: int | None = None
 
         if pipeline is not None:
             self.attach_pipeline(pipeline)
@@ -673,18 +724,90 @@ class DashboardMetricsCollector:
             self._manual_bids_depth = list(bids) if bids is not None else None
             self._manual_asks_depth = list(asks) if asks is not None else None
 
+    @property
+    def ipc_monitoring_enabled(self) -> bool:
+        """True if 100K IPC monitoring section is enabled."""
+        return self._enable_ipc_monitoring
+
+    @ipc_monitoring_enabled.setter
+    def ipc_monitoring_enabled(self, value: bool) -> None:
+        self._enable_ipc_monitoring = bool(value)
+
+    def enable_ipc_monitoring(self, enabled: bool = True) -> None:
+        """Enable or disable dedicated 100K IPC requirement monitoring."""
+        with self._lock:
+            self._enable_ipc_monitoring = enabled
+
+    def set_ipc_target(self, target_ops_per_sec: float) -> None:
+        """Configure the required IPC throughput target (default: 100,000 ops/s)."""
+        if target_ops_per_sec <= 0:
+            raise ValueError(f"target_ops_per_sec must be strictly positive (> 0), got {target_ops_per_sec}")
+        with self._lock:
+            self._ipc_target_ops_per_sec = float(target_ops_per_sec)
+
+    def record_failed_publication(self, count: int = 1) -> None:
+        """Increment manual count of failed IPC publications."""
+        if count <= 0:
+            raise ValueError(f"count must be strictly positive (> 0), got {count}")
+        with self._lock:
+            c = self._manual_failed_publications or 0
+            self._manual_failed_publications = c + count
+
+    @property
+    def failed_publications(self) -> int:
+        """Current count of failed publications."""
+        with self._lock:
+            return self._manual_failed_publications or 0
+
+    def set_ring_buffer_state(self, capacity: int | None, occupied: int | None) -> None:
+        """Manually configure ring buffer telemetry for testing or standalone demo mode."""
+        with self._lock:
+            self._manual_rb_capacity = capacity
+            self._manual_rb_occupied = occupied
+
+    def set_system_resources(self, cpu_percent: float | None, memory_mb: float | None) -> None:
+        """Manually override CPU utilization and memory usage for testing."""
+        with self._lock:
+            self._manual_cpu_percent = cpu_percent
+            self._manual_memory_mb = memory_mb
+
+    def set_ipc_warning(self, warning: str | None) -> None:
+        """Manually configure IPC warning string for testing."""
+        with self._lock:
+            self._manual_ipc_warning = warning
+
+    def _sample_resources(self, now_ns: int) -> tuple[float | None, float | None]:
+        if self._manual_cpu_percent is not None or self._manual_memory_mb is not None:
+            return self._manual_cpu_percent, self._manual_memory_mb
+        if now_ns - self._last_resource_sample_ns < 500_000_000 and self._cached_cpu is not None:
+            return self._cached_cpu, self._cached_mem
+        try:
+            import psutil
+            proc = psutil.Process()
+            cpu = proc.cpu_percent(interval=None)
+            mem = proc.memory_info().rss / (1024.0 * 1024.0)
+            self._cached_cpu = float(cpu)
+            self._cached_mem = round(float(mem), 1)
+            self._last_resource_sample_ns = now_ns
+            return self._cached_cpu, self._cached_mem
+        except Exception:
+            return None, None
+
     # --------------------------------------------------------------------------
     # Snapshot Generation
     # --------------------------------------------------------------------------
 
-    def take_snapshot(self) -> DashboardMetricsSnapshot:
+    def take_snapshot(self, timestamp_ns: int | None = None) -> DashboardMetricsSnapshot:
         """Capture an atomic, thread-safe point-in-time metrics snapshot.
+
+        Args:
+            timestamp_ns: Optional monotonic nanosecond timestamp override (useful for testing).
 
         Returns:
             Immutable DashboardMetricsSnapshot containing all current telemetry.
         """
-        now_perf_ns = time.perf_counter_ns()
-        now_wall_ns = time.time_ns()
+        now_perf_ns = timestamp_ns if timestamp_ns is not None else time.perf_counter_ns()
+        now_wall_ns = timestamp_ns if timestamp_ns is not None else time.time_ns()
 
         with self._lock:
             # 1. Elapsed Runtime
@@ -763,6 +886,69 @@ class DashboardMetricsCollector:
                 self._resolve_whale_metrics()
             )
 
+            # 11. 100K IPC Requirement & Telemetry Calculations
+            ipc_target = self._ipc_target_ops_per_sec
+            ipc_achieved_pct: float | None = None
+            if pub_rate is not None:
+                ipc_achieved_pct = (pub_rate / ipc_target) * 100.0
+
+            rolling_avg_pub_rate: float | None = None
+            if pub_rate is not None and pub_rate > 0:
+                self._published_rate_samples.append((now_perf_ns, pub_rate))
+                cutoff_ns = now_perf_ns - 5_000_000_000
+                while self._published_rate_samples and self._published_rate_samples[0][0] < cutoff_ns:
+                    self._published_rate_samples.popleft()
+
+                rates = [r for _, r in self._published_rate_samples]
+                if rates:
+                    rolling_avg_pub_rate = sum(rates) / len(rates)
+
+                if self._min_observed_published_rate is None or pub_rate < self._min_observed_published_rate:
+                    self._min_observed_published_rate = pub_rate
+                if self._max_observed_published_rate is None or pub_rate > self._max_observed_published_rate:
+                    self._max_observed_published_rate = pub_rate
+
+            if elapsed_sec is None or elapsed_sec < 0.2:
+                sustained_status = "IDLE / INITIALIZING"
+            elif (
+                len(self._published_rate_samples) >= 3
+                and (now_perf_ns - self._published_rate_samples[0][0]) >= 3_000_000_000
+                and rolling_avg_pub_rate is not None
+                and rolling_avg_pub_rate >= ipc_target
+            ):
+                sustained_status = "SUSTAINED: ACHIEVED (>=100K)"
+            elif pub_rate is not None and pub_rate >= ipc_target:
+                sustained_status = "BURST ONLY (<5s window)"
+            elif pub_rate is not None and pub_rate > 0:
+                sustained_status = "TARGET UNMET (<100K)"
+            else:
+                sustained_status = "AWAITING ORDER FLOW"
+
+            occupancy_pct: float | None = None
+            if rb_cap is not None and rb_cap > 0 and rb_occ is not None:
+                occupancy_pct = (float(rb_occ) / float(rb_cap)) * 100.0
+
+            failed_pubs = self._manual_failed_publications
+            if failed_pubs is None:
+                failed_pubs = (drop_orders or 0) + (backpressure or 0)
+
+            prod_status = "PROD:OK (Active)" if prod_ok else "PROD:ERR (Halted)"
+            cons_status = "CONS:OK (Active)" if cons_ok else "CONS:ERR (Halted)"
+            eng_status = "MATCH:OK (Cython)" if is_cython else "MATCH:OK (Python)"
+
+            cpu_pct, mem_mb = self._sample_resources(now_perf_ns)
+
+            ipc_warning = self._manual_ipc_warning
+            if ipc_warning is None:
+                if occupancy_pct is not None and occupancy_pct >= 70.0:
+                    ipc_warning = f"Consumer falling behind: buffer occupancy {occupancy_pct:.1f}%"
+                elif target_rate is not None and target_rate >= 50_000 and gen_rate is not None and gen_rate < target_rate * 0.4:
+                    ipc_warning = f"Producer slow: gen rate {gen_rate:,.0f}/s below target {target_rate:,.0f}/s"
+                elif (drop_orders or 0) > 0:
+                    ipc_warning = f"Buffer overflow: {drop_orders:,} orders dropped"
+                elif (backpressure or 0) > 0:
+                    ipc_warning = f"Backpressure active: {backpressure:,} wait events"
+
             return DashboardMetricsSnapshot(
                 timestamp_ns=now_perf_ns,
                 wall_timestamp_ns=now_wall_ns,
@@ -809,6 +995,22 @@ class DashboardMetricsCollector:
                 is_stopped=is_stopped,
                 is_cython_accelerated=is_cython,
                 source_name=self.source_name,
+                ipc_target_ops_per_sec=ipc_target,
+                ipc_target_achieved_pct=ipc_achieved_pct,
+                ipc_current_window_rate=pub_rate,
+                ipc_rolling_avg_rate=rolling_avg_pub_rate,
+                ipc_min_rate=self._min_observed_published_rate,
+                ipc_max_rate=self._max_observed_published_rate,
+                ipc_sustained_status=sustained_status,
+                ring_buffer_occupancy_pct=occupancy_pct,
+                failed_publications=failed_pubs,
+                producer_status=prod_status,
+                consumer_status=cons_status,
+                matching_engine_status=eng_status,
+                cpu_percent=cpu_pct,
+                memory_mb=mem_mb,
+                ipc_warning=ipc_warning,
+                ipc_monitoring_enabled=self._enable_ipc_monitoring,
             )
 
     # --------------------------------------------------------------------------
@@ -1061,6 +1263,12 @@ class DashboardMetricsCollector:
     def _resolve_ring_buffer_telemetry(
         self,
     ) -> tuple[int | None, int | None, float | None]:
+        if self._manual_rb_capacity is not None or self._manual_rb_occupied is not None:
+            cap = self._manual_rb_capacity
+            occ = self._manual_rb_occupied
+            util = (max(0.0, min(1.0, float(occ) / float(cap)))) if (cap is not None and cap > 0 and occ is not None) else None
+            return cap, occ, util
+
         if self._pipeline is not None and getattr(self._pipeline, "is_closed", False):
             return None, None, None
 
